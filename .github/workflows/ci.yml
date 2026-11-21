@@ -37,10 +37,15 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Vet & Race Tests
+      - name: Vet & Race Tests with Coverage
         run: |
           go vet ./...
-          go test -race -count=1 -v ./...
+          go test -race -count=1 -coverprofile=coverage.out -covermode=atomic -v ./...
+      - name: Upload Coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: ./coverage.out
+          fail_ci_if_error: false
       - name: Policy Config Validation
         run: go run ./cmd/pgveil validate --config configs/pgveil.yaml
       - name: Microbenchmarks

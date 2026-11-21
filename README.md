@@ -4,6 +4,8 @@
 
 <p align="center">
   <a href="https://github.com/duhanguler/pgveil/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/duhanguler/pgveil/ci.yml?branch=main&style=flat-square&label=CI" alt="CI" /></a>
+  <a href="https://pkg.go.dev/github.com/duhanguler/pgveil"><img src="https://pkg.go.dev/badge/github.com/duhanguler/pgveil.svg" alt="Go Reference" /></a>
+  <a href="https://app.codecov.io/gh/duhanguler/pgveil"><img src="https://codecov.io/gh/duhanguler/pgveil/graph/badge.svg" alt="codecov" /></a>
   <a href="https://github.com/duhanguler/pgveil/releases"><img src="https://img.shields.io/badge/Release-v0.4.0-18181b?style=flat-square" alt="v0.4.0" /></a>
   <a href="https://github.com/duhanguler/homebrew-tap"><img src="https://img.shields.io/badge/Homebrew-duhanguler%2Ftap%2Fpgveil-18181b?style=flat-square&logo=homebrew&logoColor=white" alt="Homebrew Tap" /></a>
   <img src="https://img.shields.io/badge/Go-1.26%2B-00ADD8?style=flat-square&logo=go&logoColor=white" alt="Go 1.26+" />

@@ -1,6 +1,6 @@
 .PHONY: ui build test bench lint helm-lint docker-up docker-down clean
 
-VERSION ?= 0.3.0
+VERSION ?= 0.3.1
 COMMIT  ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo dev)
 
 ui:

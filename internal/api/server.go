@@ -2,7 +2,9 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -87,7 +89,32 @@ func (s *Server) Handler() http.Handler {
 		mux.Handle("/", s.spaHandler(s.webFS))
 	}
 
-	return withCORS(mux)
+	return withCORS(s.withOptionalAuth(mux))
+}
+
+func (s *Server) withOptionalAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		token := s.policyMgr.Config().Security.AdminToken
+		if token == "" || !strings.HasPrefix(r.URL.Path, "/api/v1/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		authz := strings.TrimSpace(r.Header.Get("Authorization"))
+		const prefix = "Bearer "
+		provided := ""
+		if strings.HasPrefix(authz, prefix) {
+			provided = strings.TrimSpace(strings.TrimPrefix(authz, prefix))
+		} else if qTok := r.URL.Query().Get("token"); qTok != "" && r.URL.Path == "/api/v1/events/stream" {
+			// EventSource in browsers cannot set custom Authorization headers; allow query token on SSE only.
+			provided = qTok
+		}
+		if subtle.ConstantTimeCompare([]byte(provided), []byte(token)) != 1 {
+			w.Header().Set("WWW-Authenticate", `Bearer realm="pgveil"`)
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized: valid Bearer token required"})
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -175,7 +202,7 @@ func (s *Server) handleEventStream(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleGetPolicies(w http.ResponseWriter, r *http.Request) {
 	cfg := s.policyMgr.Config()
-	rawYAML, version := s.policyMgr.RawYAML()
+	redactedYAML, version := s.policyMgr.RedactedYAML()
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":         version,
 		"default_profile": cfg.DefaultProfile,
@@ -190,7 +217,7 @@ func (s *Server) handleGetPolicies(w http.ResponseWriter, r *http.Request) {
 			"uk-gdpr": pii.PackEntities[pii.PackUKGDPR],
 			"secrets": pii.PackEntities[pii.PackSecrets],
 		},
-		"yaml": rawYAML,
+		"yaml": redactedYAML,
 	})
 }
 
@@ -225,7 +252,7 @@ func (s *Server) handleInspect(w http.ResponseWriter, r *http.Request) {
 		Profile string `json:"profile"`
 		Sample  string `json:"sample_text"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
@@ -255,7 +282,7 @@ func (s *Server) handlePlaygroundQuery(w http.ResponseWriter, r *http.Request) {
 		SQL     string `json:"sql"`
 		Profile string `json:"profile"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
@@ -272,17 +299,23 @@ func (s *Server) handlePlaygroundQuery(w http.ResponseWriter, r *http.Request) {
 
 	cfg := s.policyMgr.Config()
 	proxyTarget := s.resolveProxyAddr()
-	if strings.HasPrefix(proxyTarget, ":") {
-		proxyTarget = "127.0.0.1" + proxyTarget
+	appName := prof.Name
+	for _, cand := range prof.Match.ApplicationNames {
+		c := strings.TrimSpace(cand)
+		if c != "" && !strings.ContainsAny(c, "*?[]") {
+			appName = c
+			break
+		}
 	}
 
 	// Build pgx connection config targeting pgveil wire proxy with profile-matched application_name
-	connStr := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable&application_name=%s",
+	connStr := policy.BuildDSN(
+		proxyTarget,
 		cfg.Server.UpstreamUser,
 		cfg.Server.UpstreamPassword,
-		proxyTarget,
 		cfg.Server.UpstreamDatabase,
-		prof.Name,
+		appName,
+		cfg.Server.TLS.Enabled,
 	)
 	connCfg, err := pgx.ParseConfig(connStr)
 	if err != nil {
@@ -411,7 +444,7 @@ func (s *Server) handleResolveApproval(approve bool) http.HandlerFunc {
 			Reviewer string `json:"reviewer"`
 			Note     string `json:"note"`
 		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		_ = json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&body)
 		req, err := s.hitlMgr.Resolve(id, approve, body.Reviewer, body.Note)
 		if err != nil {
 			writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
@@ -425,21 +458,18 @@ func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		SampleRows int `json:"sample_rows"`
 	}
-	_ = json.NewDecoder(r.Body).Decode(&req)
+	_ = json.NewDecoder(io.LimitReader(r.Body, 64*1024)).Decode(&req)
 	if req.SampleRows <= 0 {
 		req.SampleRows = 50
 	}
 	cfg := s.policyMgr.Config()
-	sslMode := "disable"
-	if cfg.Server.UpstreamTLS.Enabled {
-		sslMode = "require"
-	}
-	dsn := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=%s&application_name=pgveil-discover",
+	dsn := policy.BuildDSN(
+		cfg.Server.UpstreamAddr,
 		cfg.Server.UpstreamUser,
 		cfg.Server.UpstreamPassword,
-		cfg.Server.UpstreamAddr,
 		cfg.Server.UpstreamDatabase,
-		sslMode,
+		"pgveil-discover",
+		cfg.Server.UpstreamTLS.Enabled,
 	)
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 	defer cancel()
@@ -481,11 +511,7 @@ func (s *Server) resolveProxyAddr() string {
 }
 
 func asPgErr(err error, target **pgconn.PgError) bool {
-	if pe, ok := err.(*pgconn.PgError); ok {
-		*target = pe
-		return true
-	}
-	return false
+	return errors.As(err, target)
 }
 
 func writeJSON(w http.ResponseWriter, status int, data any) {

@@ -107,7 +107,7 @@ func defaultStrategyForEntity(t EntityType) Strategy {
 	switch t {
 	case EntityCreditCard:
 		return StrategyLast4
-	case EntityPrivateKey, EntityAWSAccessKey, EntityGitHubToken, EntityOpenAIKey, EntityJWT, EntityUSSSN, EntityCASIN, EntityUKNINO:
+	case EntityPrivateKey, EntityAWSAccessKey, EntityGitHubToken, EntityOpenAIKey, EntityStripeKey, EntitySlackToken, EntityJWT, EntitySecret, EntityUSSSN, EntityCASIN, EntityUKNINO:
 		return StrategyRedact
 	default:
 		return StrategyPartial
@@ -132,7 +132,7 @@ func inferEntityFromColumn(col string) EntityType {
 	case strings.Contains(c, "phone") || strings.Contains(c, "mobile") || strings.Contains(c, "tel"):
 		return EntityPhoneTR
 	case strings.Contains(c, "secret") || strings.Contains(c, "api_key") || strings.Contains(c, "token") || strings.Contains(c, "password"):
-		return EntityAWSAccessKey
+		return EntitySecret
 	default:
 		return ""
 	}
@@ -188,12 +188,12 @@ func maskPartial(val string, entity EntityType) string {
 	switch entity {
 	case EntityEmail:
 		if idx := strings.IndexByte(val, '@'); idx > 0 {
-			local := val[:idx]
+			localRunes := []rune(val[:idx])
 			domain := val[idx:]
-			if len(local) <= 1 {
+			if len(localRunes) <= 1 {
 				return "*" + domain
 			}
-			return local[:1] + "***" + domain
+			return string(localRunes[:1]) + "***" + domain
 		}
 	case EntityTRIBAN, EntityEUIBAN:
 		clean := strings.ReplaceAll(strings.ReplaceAll(val, " ", ""), "-", "")
@@ -208,7 +208,11 @@ func maskPartial(val string, entity EntityType) string {
 		return maskLast4(val)
 	case EntityPhoneTR, EntityPhoneIntl:
 		if len(val) >= 7 {
-			return val[:4] + " *** ** " + val[len(val)-2:]
+			prefix := strings.TrimSpace(val[:4])
+			if prefix == "" {
+				prefix = val[:2]
+			}
+			return prefix + " *** ** " + val[len(val)-2:]
 		}
 	case EntityIPv4:
 		parts := strings.Split(val, ".")

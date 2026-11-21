@@ -3,8 +3,11 @@ package policy
 import (
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -12,6 +15,11 @@ import (
 	"github.com/duhanguler/pgveil/internal/pii"
 	"gopkg.in/yaml.v3"
 )
+
+// RedactedPlaceholder replaces sensitive config secrets in Control Plane API responses.
+const RedactedPlaceholder = "__PGVEIL_REDACTED__"
+
+var secretYAMLLineRe = regexp.MustCompile(`(?m)^(\s*(?:upstream_password|masking_secret|admin_token|webhook_url)\s*:\s*)(.+?)(\s*(?:#.*)?)$`)
 
 // Config is the root pgveil runtime and policy configuration.
 type Config struct {
@@ -53,6 +61,7 @@ type TLSConfig struct {
 
 type SecurityConfig struct {
 	MaskingSecret      string   `yaml:"masking_secret" json:"masking_secret,omitempty"`
+	AdminToken         string   `yaml:"admin_token" json:"-"`
 	HITLDefaultTimeout string   `yaml:"hitl_default_timeout" json:"hitl_default_timeout"`
 	CompliancePacks    []string `yaml:"compliance_packs" json:"compliance_packs"`
 }
@@ -213,8 +222,14 @@ func LoadBytes(data []byte) (*Manager, error) {
 }
 
 // ReloadBytes atomically validates and swaps the active policy configuration.
+// Any secret field equal to RedactedPlaceholder preserves the currently active secret so
+// Control Plane Policy Studio edits never leak or clobber credentials.
 func (m *Manager) ReloadBytes(data []byte) error {
-	cfg, err := parseAndCompile(data)
+	m.mu.RLock()
+	prev := m.cfg
+	m.mu.RUnlock()
+
+	cfg, err := parseAndCompileWithPrev(data, prev)
 	if err != nil {
 		return err
 	}
@@ -225,6 +240,63 @@ func (m *Manager) ReloadBytes(data []byte) error {
 	m.masker = pii.NewMasker(cfg.Security.MaskingSecret)
 	m.version++
 	return nil
+}
+
+// RedactedYAML returns the active YAML with secrets (passwords, HMAC keys, admin tokens, webhooks) redacted.
+func (m *Manager) RedactedYAML() (string, int64) {
+	m.mu.RLock()
+	raw := m.rawYAML
+	ver := m.version
+	m.mu.RUnlock()
+	redacted := secretYAMLLineRe.ReplaceAllStringFunc(raw, func(line string) string {
+		parts := secretYAMLLineRe.FindStringSubmatch(line)
+		if len(parts) < 4 {
+			return line
+		}
+		val := strings.TrimSpace(strings.Trim(parts[2], `"'`))
+		if val == "" {
+			return line
+		}
+		return parts[1] + `"` + RedactedPlaceholder + `"` + parts[3]
+	})
+	return redacted, ver
+}
+
+// BuildDSN constructs a safely URL-encoded PostgreSQL connection URI (handles special characters
+// in usernames/passwords, normalizes wildcard bind addresses, and sets sslmode cleanly).
+func BuildDSN(addr, user, password, database, appName string, tlsEnabled bool) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err == nil {
+		if host == "" || host == "0.0.0.0" || host == "::" {
+			host = "127.0.0.1"
+		}
+		addr = net.JoinHostPort(host, port)
+	} else if strings.HasPrefix(addr, ":") {
+		addr = "127.0.0.1" + addr
+	}
+	u := &url.URL{
+		Scheme: "postgres",
+		Host:   addr,
+		Path:   "/" + database,
+	}
+	if user != "" {
+		if password != "" {
+			u.User = url.UserPassword(user, password)
+		} else {
+			u.User = url.User(user)
+		}
+	}
+	q := url.Values{}
+	if tlsEnabled {
+		q.Set("sslmode", "require")
+	} else {
+		q.Set("sslmode", "disable")
+	}
+	if appName != "" {
+		q.Set("application_name", appName)
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 // ReloadFile re-reads the configured YAML file from disk (used by SIGHUP).
@@ -320,9 +392,27 @@ func matchesAny(val string, patterns []string) bool {
 }
 
 func parseAndCompile(data []byte) (*Config, error) {
+	return parseAndCompileWithPrev(data, nil)
+}
+
+func parseAndCompileWithPrev(data []byte, prev *Config) (*Config, error) {
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parse yaml: %w", err)
+	}
+	if prev != nil {
+		if cfg.Server.UpstreamPassword == RedactedPlaceholder {
+			cfg.Server.UpstreamPassword = prev.Server.UpstreamPassword
+		}
+		if cfg.Security.MaskingSecret == RedactedPlaceholder {
+			cfg.Security.MaskingSecret = prev.Security.MaskingSecret
+		}
+		if cfg.Security.AdminToken == RedactedPlaceholder {
+			cfg.Security.AdminToken = prev.Security.AdminToken
+		}
+		if cfg.Notifications.WebhookURL == RedactedPlaceholder {
+			cfg.Notifications.WebhookURL = prev.Notifications.WebhookURL
+		}
 	}
 	applyEnvOverrides(&cfg)
 	applyDefaults(&cfg)
@@ -365,6 +455,9 @@ func applyEnvOverrides(cfg *Config) {
 	}
 	if v := os.Getenv("PGVEIL_MASKING_SECRET"); v != "" {
 		cfg.Security.MaskingSecret = v
+	}
+	if v := os.Getenv("PGVEIL_ADMIN_TOKEN"); v != "" {
+		cfg.Security.AdminToken = v
 	}
 	if v := os.Getenv("PGVEIL_KAFKA_ENABLED"); v == "true" || v == "1" {
 		cfg.Kafka.Enabled = true

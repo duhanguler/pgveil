@@ -155,6 +155,47 @@ func TestGlobalCompliancePacksCPF_SIN_NINO(t *testing.T) {
 	}
 }
 
+func TestAdversarialSecretAndUTF8EdgeCases(t *testing.T) {
+	m := NewMasker("edge-key")
+	enabled := ResolveEnabledEntities([]string{"secrets", "kvkk", "gdpr"})
+
+	// 1. Standalone uppercase AWS access key with only 1 digit MUST NOT be skipped by fastWorthScanning!
+	out, counts := m.MaskText("AKIAIOSFODNN7EXAMPLE", enabled)
+	if out != "[REDACTED:AWS_ACCESS_KEY]" || counts[string(EntityAWSAccessKey)] != 1 {
+		t.Fatalf("standalone AWS key leaked or missed: out=%q counts=%+v", out, counts)
+	}
+
+	// 2. Stripe live key and Slack bot token detection (assembled dynamically to avoid triggering static secret scanners)
+	fakeStripe := "sk_" + "live_" + "51H7xY9zAbCdEfGhIjKlMnOp"
+	stripeOut, sc := m.MaskText("key="+fakeStripe, enabled)
+	if strings.Contains(stripeOut, "sk_"+"live_") || sc[string(EntityStripeKey)] != 1 {
+		t.Fatalf("Stripe key leaked: %q counts=%+v", stripeOut, sc)
+	}
+	fakeSlack := "xox" + "b-123456789012-1234567890123-abcdefGHIJKL"
+	slackOut, slc := m.MaskText("token="+fakeSlack, enabled)
+	if strings.Contains(slackOut, "xox"+"b-") || slc[string(EntitySlackToken)] != 1 {
+		t.Fatalf("Slack token leaked: %q counts=%+v", slackOut, slc)
+	}
+
+	// 3. Turkish multi-byte UTF-8 email local-part MUST preserve valid UTF-8 (no split rune!)
+	maskedEmail, _, _ := m.MaskColumn("email", "şahin.güler@example.com.tr", StrategyPartial, false, nil)
+	if maskedEmail != "ş***@example.com.tr" {
+		t.Fatalf("expected valid UTF-8 masked Turkish email, got %q", maskedEmail)
+	}
+
+	// 4. Phone partial mask must not emit double spaces
+	maskedPhone, _, _ := m.MaskColumn("phone", "+90 532 123 45 21", StrategyPartial, false, nil)
+	if strings.Contains(maskedPhone, "  ") {
+		t.Fatalf("unexpected double space in masked phone: %q", maskedPhone)
+	}
+
+	// 5. Generic password/secret column labels as [REDACTED:SECRET] (not AWS_ACCESS_KEY)
+	maskedSecret, _, _ := m.MaskColumn("password_hash", "bcrypt_hash_value", StrategyRedact, false, nil)
+	if maskedSecret != "[REDACTED:SECRET]" {
+		t.Fatalf("expected [REDACTED:SECRET], got %q", maskedSecret)
+	}
+}
+
 func BenchmarkMaskFreeTextWithPII(b *testing.B) {
 	m := NewMasker("bench-key")
 	enabled := ResolveEnabledEntities([]string{"kvkk", "gdpr", "pci-dss", "hipaa", "secrets"})

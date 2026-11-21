@@ -26,8 +26,11 @@ const (
 	EntityAWSAccessKey EntityType = "aws_access_key"
 	EntityGitHubToken  EntityType = "github_token"
 	EntityOpenAIKey    EntityType = "openai_key"
+	EntityStripeKey    EntityType = "stripe_key"
+	EntitySlackToken   EntityType = "slack_token"
 	EntityJWT          EntityType = "jwt_token"
 	EntityPrivateKey   EntityType = "private_key"
+	EntitySecret       EntityType = "secret"
 )
 
 // CompliancePack groups entity detectors by regulatory standard.
@@ -88,6 +91,8 @@ var PackEntities = map[CompliancePack][]EntityType{
 		EntityAWSAccessKey,
 		EntityGitHubToken,
 		EntityOpenAIKey,
+		EntityStripeKey,
+		EntitySlackToken,
 		EntityJWT,
 	},
 }
@@ -105,6 +110,8 @@ var (
 	reAWSAccessKey = regexp.MustCompile(`\b(?:AKIA|ASIA|AIDA|AROA)[0-9A-Z]{16}\b`)
 	reGitHubToken  = regexp.MustCompile(`\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b|\bgithub_pat_[A-Za-z0-9_]{20,}\b`)
 	reOpenAIKey    = regexp.MustCompile(`\bsk-(?:proj-|live-|test-)?[A-Za-z0-9_-]{20,}\b`)
+	reStripeKey    = regexp.MustCompile(`\b(?:sk|rk)_(?:live|test)_[0-9A-Za-z]{16,}\b`)
+	reSlackToken   = regexp.MustCompile(`\bxox[baprs]-[0-9A-Za-z-]{10,}\b`)
 	reJWT          = regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b`)
 	reIBAN         = regexp.MustCompile(`\b([A-Z]{2}\d{2}(?:[ -]?[A-Z0-9]){11,30})\b`)
 	reCreditCard   = regexp.MustCompile(`\b(?:\d[ -]?){13,19}\b`)
@@ -417,6 +424,7 @@ func fastWorthScanning(s string) bool {
 		return false
 	}
 	digits := 0
+	upper := 0
 	hasAt := false
 	hasDash := false
 	hasDot := false
@@ -426,6 +434,8 @@ func fastWorthScanning(s string) bool {
 		switch {
 		case c >= '0' && c <= '9':
 			digits++
+		case c >= 'A' && c <= 'Z':
+			upper++
 		case c == '@':
 			hasAt = true
 		case c == '-':
@@ -436,7 +446,12 @@ func fastWorthScanning(s string) bool {
 			hasUnderscore = true
 		}
 	}
-	return digits >= 4 || hasAt || hasUnderscore || (hasDash && len(s) >= 15) || (hasDot && digits >= 4)
+	return digits >= 4 ||
+		hasAt ||
+		hasUnderscore ||
+		(hasDash && len(s) >= 14) ||
+		(hasDot && digits >= 4) ||
+		(upper >= 12 && len(s) >= 16)
 }
 
 // Detect scans text for all enabled PII & secret entities and returns non-overlapping matches
@@ -476,6 +491,12 @@ func Detect(text string, enabled map[EntityType]bool) []Match {
 	}
 	if strings.Contains(text, "sk-") {
 		addMatches(reOpenAIKey, EntityOpenAIKey, nil)
+	}
+	if strings.Contains(text, "sk_") || strings.Contains(text, "rk_") {
+		addMatches(reStripeKey, EntityStripeKey, nil)
+	}
+	if strings.Contains(text, "xox") {
+		addMatches(reSlackToken, EntitySlackToken, nil)
 	}
 	if strings.Contains(text, "eyJ") {
 		addMatches(reJWT, EntityJWT, nil)

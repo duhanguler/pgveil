@@ -46,3 +46,19 @@ func TestBuildRecommendedYAML(t *testing.T) {
 		t.Fatalf("expected denied_tables api_secrets:\n%s", yml)
 	}
 }
+
+func TestRecommendStrategyDeterministic(t *testing.T) {
+	entities := map[string]int{
+		string(pii.EntityTCKN):         5,
+		string(pii.EntityCreditCard):   2,
+		string(pii.EntityAWSAccessKey): 1,
+		string(pii.EntityEmail):        4,
+	}
+	// Run 50 iterations to ensure map iteration order NEVER causes non-determinism
+	for i := 0; i < 50; i++ {
+		strat, risk := recommendStrategyAndRisk(entities, "", "")
+		if strat != pii.StrategyRedact || risk != "CRITICAL" {
+			t.Fatalf("iteration %d: expected deterministic (redact, CRITICAL), got (%s, %s)", i, strat, risk)
+		}
+	}
+}

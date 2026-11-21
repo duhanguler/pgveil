@@ -67,11 +67,14 @@ func Scan(ctx context.Context, dsn string, sampleRows int, maskingSecret string)
 	_ = conn.QueryRow(ctx, "SELECT current_database()").Scan(&dbName)
 
 	rows, err := conn.Query(ctx, `
-		SELECT table_schema, table_name, column_name, data_type
-		FROM information_schema.columns
-		WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
-		  AND table_name NOT LIKE 'pgveil_%'
-		ORDER BY table_schema, table_name, ordinal_position
+		SELECT c.table_schema, c.table_name, c.column_name, c.data_type
+		FROM information_schema.columns c
+		JOIN information_schema.tables t
+		  ON t.table_schema = c.table_schema AND t.table_name = c.table_name
+		WHERE c.table_schema NOT IN ('pg_catalog', 'information_schema')
+		  AND t.table_type = 'BASE TABLE'
+		  AND c.table_name NOT LIKE 'pgveil_%'
+		ORDER BY c.table_schema, c.table_name, c.ordinal_position
 	`)
 	if err != nil {
 		return nil, fmt.Errorf("query information_schema: %w", err)
@@ -110,8 +113,10 @@ func Scan(ctx context.Context, dsn string, sampleRows int, maskingSecret string)
 			pgx.Identifier{c.column}.Sanitize(),
 			sampleRows,
 		)
-		sRows, err := conn.Query(ctx, q)
+		qCtx, qCancel := context.WithTimeout(ctx, 5*time.Second)
+		sRows, err := conn.Query(qCtx, q)
 		if err != nil {
+			qCancel()
 			continue
 		}
 
@@ -133,14 +138,15 @@ func Scan(ctx context.Context, dsn string, sampleRows int, maskingSecret string)
 					entityCounts[k] += v
 				}
 				if sampleMasked == "" {
-					if len(masked) > 100 {
-						masked = masked[:100] + "..."
+					if r := []rune(masked); len(r) > 100 {
+						masked = string(r[:100]) + "..."
 					}
 					sampleMasked = masked
 				}
 			}
 		}
 		sRows.Close()
+		qCancel()
 
 		heurEnt, heurStrat, heurRisk := heuristicFromColumnName(c.column)
 		hasContent := len(entityCounts) > 0
@@ -212,6 +218,7 @@ func isScannableType(dt string) bool {
 		strings.Contains(d, "text") ||
 		strings.Contains(d, "json") ||
 		strings.Contains(d, "inet") ||
+		strings.Contains(d, "cidr") ||
 		strings.Contains(d, "citext")
 }
 
@@ -260,7 +267,7 @@ func packsForEntities(entities map[string]int) []string {
 			packSet["pipeda"] = true
 		case pii.EntityUKNINO:
 			packSet["uk-gdpr"] = true
-		case pii.EntityAWSAccessKey, pii.EntityGitHubToken, pii.EntityOpenAIKey, pii.EntityJWT, pii.EntityPrivateKey:
+		case pii.EntityAWSAccessKey, pii.EntityGitHubToken, pii.EntityOpenAIKey, pii.EntityStripeKey, pii.EntitySlackToken, pii.EntityJWT, pii.EntityPrivateKey, pii.EntitySecret:
 			packSet["secrets"] = true
 		default:
 			if ent == "secret_column" {
@@ -279,24 +286,31 @@ func packsForEntities(entities map[string]int) []string {
 	return out
 }
 
+// recommendStrategyAndRisk selects the strictest strategy & risk level deterministically
+// (independent of Go map iteration order when multiple entity types appear in one column).
 func recommendStrategyAndRisk(entities map[string]int, heurStrat pii.Strategy, heurRisk string) (pii.Strategy, string) {
-	for ent := range entities {
-		switch pii.EntityType(ent) {
-		case pii.EntityAWSAccessKey, pii.EntityGitHubToken, pii.EntityOpenAIKey, pii.EntityJWT, pii.EntityPrivateKey, pii.EntityUSSSN:
-			return pii.StrategyRedact, "CRITICAL"
-		case pii.EntityCreditCard:
-			return pii.StrategyLast4, "CRITICAL"
-		case pii.EntityTCKN, pii.EntityBRCPF, pii.EntityCASIN, pii.EntityUKNINO:
-			return pii.StrategyPartial, "CRITICAL"
+	has := func(types ...pii.EntityType) bool {
+		for _, t := range types {
+			if entities[string(t)] > 0 {
+				return true
+			}
 		}
+		return false
+	}
+	if has(pii.EntityPrivateKey, pii.EntityAWSAccessKey, pii.EntityGitHubToken, pii.EntityOpenAIKey, pii.EntityStripeKey, pii.EntitySlackToken, pii.EntityJWT, pii.EntitySecret, pii.EntityUSSSN) {
+		return pii.StrategyRedact, "CRITICAL"
+	}
+	if has(pii.EntityCreditCard) {
+		return pii.StrategyLast4, "CRITICAL"
+	}
+	if has(pii.EntityTCKN, pii.EntityBRCPF, pii.EntityCASIN, pii.EntityUKNINO) {
+		return pii.StrategyPartial, "CRITICAL"
 	}
 	if heurRisk != "" {
 		return heurStrat, heurRisk
 	}
-	for ent := range entities {
-		if ent == string(pii.EntityTRIBAN) || ent == string(pii.EntityEUIBAN) || ent == string(pii.EntityEmail) {
-			return pii.StrategyPartial, "HIGH"
-		}
+	if has(pii.EntityTRIBAN, pii.EntityEUIBAN, pii.EntityEmail) {
+		return pii.StrategyPartial, "HIGH"
 	}
 	return pii.StrategyPartial, "MEDIUM"
 }

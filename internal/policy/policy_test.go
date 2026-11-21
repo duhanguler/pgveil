@@ -61,3 +61,10 @@ func TestHotReloadValidation(t *testing.T) {
 		t.Fatalf("expected version increment from %d to %d, got %d", v1, v1+1, v2)
 	}
 }
+
+func TestBuildDSNAndSecretRedaction(t *testing.T) {
+	dsn := BuildDSN("[::]:6432", "pg@user", "p@ss/w#rd%20:1", "prod_db", "pgveil-mcp", true)
+	if dsn != "postgres://pg%40user:p%40ss%2Fw%23rd%2520%3A1@127.0.0.1:6432/prod_db?application_name=pgveil-mcp&sslmode=require" {
+		t.Fatalf("unexpected encoded DSN: %s", dsn)
+	}
+}

@@ -161,16 +161,16 @@ func main() {
 	flushTicker := time.NewTicker(cfg.flushInterval)
 	defer flushTicker.Stop()
 
-	flush := func() {
+	flush := func(flushCtx context.Context) {
 		if len(batch) == 0 {
 			return
 		}
-		if err := persistBatch(ctx, pool, batch); err != nil {
+		if err := persistBatch(flushCtx, pool, batch); err != nil {
 			slog.Error("batch persist to pgveil_audit_log failed", "count", len(batch), "err", err)
 			return
 		}
 		batchesFlushed.Inc()
-		if err := kafkaClient.CommitUncommittedOffsets(ctx); err != nil {
+		if err := kafkaClient.CommitUncommittedOffsets(flushCtx); err != nil {
 			slog.Warn("kafka offset commit warning", "err", err)
 		}
 		slog.Info("persisted audit batch", "rows", len(batch))
@@ -180,13 +180,14 @@ func main() {
 	for {
 		select {
 		case <-ctx.Done():
-			flush()
-			shutCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			// Use a fresh non-canceled context so final batch flush & Kafka offset commit succeed on SIGTERM!
+			shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			flush(shutCtx)
 			_ = httpSrv.Shutdown(shutCtx)
 			cancel()
 			return
 		case <-flushTicker.C:
-			flush()
+			flush(ctx)
 		default:
 			pollCtx, cancel := context.WithTimeout(ctx, 1*time.Second)
 			fetches := kafkaClient.PollFetches(pollCtx)
@@ -194,6 +195,7 @@ func main() {
 			if fetches.IsClientClosed() {
 				return
 			}
+			alertsProcessed := false
 			fetches.EachRecord(func(rec *kgo.Record) {
 				var ev events.AuditEvent
 				if err := json.Unmarshal(rec.Value, &ev); err != nil {
@@ -204,6 +206,7 @@ func main() {
 				consumedTotal.WithLabelValues(rec.Topic, "ok").Inc()
 
 				if rec.Topic == cfg.alertsTopic {
+					alertsProcessed = true
 					if triggered, count := tracker.RecordBlocked(ev.RoleProfile, time.Now()); triggered {
 						anomaliesTotal.WithLabelValues(ev.RoleProfile).Inc()
 						slog.Warn("SECURITY BURST ANOMALY DETECTED",
@@ -221,9 +224,12 @@ func main() {
 
 				batch = append(batch, ev)
 				if len(batch) >= cfg.batchSize {
-					flush()
+					flush(ctx)
 				}
 			})
+			if alertsProcessed && len(batch) == 0 {
+				_ = kafkaClient.CommitUncommittedOffsets(ctx)
+			}
 		}
 	}
 }

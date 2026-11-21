@@ -247,6 +247,23 @@ func (s *Server) handleConnection(ctx context.Context, clientConn net.Conn) {
 			}
 			extBatch = extBatch[:0]
 
+		case pgwire.MsgFunctionCall:
+			// Block legacy PostgreSQL Wire v3 Fast-Path FunctionCall ('F') frames which can invoke
+			// arbitrary server functions by OID (e.g., lo_export, pg_read_file) bypassing SQL AST parsing.
+			profile := s.policyMgr.MatchProfile(meta.dbUser, meta.appName)
+			dec := firewall.Decision{
+				Action:        firewall.ActionBlock,
+				StatementType: "FUNCTION_CALL",
+				RiskLevel:     "CRITICAL",
+				Rule:          "block_fastpath_function_call",
+				Reason:        "Legacy PostgreSQL wire fast-path FunctionCall ('F') is blocked by pgveil",
+				Fingerprint:   "wire_fastpath_fn",
+			}
+			s.recordAndEmitBlocked(nil, meta, profile, "<wire-fastpath-function-call>", dec, "BLOCKED", 0)
+			if err := s.sendBlockedErrorCode(clientConn, meta.txStatus, "0A000", dec.Reason, "rule=block_fastpath_function_call", "Use standard SQL queries instead of legacy fast-path function calls"); err != nil {
+				return
+			}
+
 		default:
 			// Pass through other frontend frames (e.g., CopyData/CopyDone/CopyFail)
 			if err := pgwire.WriteMessage(upstreamConn, msgType, payload); err != nil {
@@ -408,13 +425,21 @@ func (s *Server) handleExtendedBatch(
 	spanCtx, span := s.startSpan(ctx, "pgveil.extended_query", meta, profile)
 	defer span.End()
 
-	// Inspect Parse / Bind / Describe statements in this pipeline batch
-	var primarySQL string
-	var primaryDec firewall.Decision
+	// Inspect EVERY Parse and Bind statement in this pipeline batch so a blocked or HITL
+	// statement can NEVER hide behind a subsequent benign `SELECT 1` in the same pipeline!
+	type inspectedStmt struct {
+		sql string
+		dec firewall.Decision
+	}
+	var inspected []inspectedStmt
+	var pendingStmts []struct {
+		name  string
+		query string
+	}
 	var activeStmtName string
 	var proxyOverhead time.Duration
-	hasQuery := false
 	hasSync := false
+	parsedInBatch := make(map[string]bool)
 
 	for i := range batch {
 		m := &batch[i]
@@ -426,15 +451,16 @@ func (s *Server) handleExtendedBatch(
 			if err != nil {
 				continue
 			}
-			meta.prepStmts[stmtName] = query
-			delete(meta.stmtFields, stmtName)
+			pendingStmts = append(pendingStmts, struct {
+				name  string
+				query string
+			}{name: stmtName, query: query})
+			parsedInBatch[stmtName] = true
 			activeStmtName = stmtName
 			t0 := time.Now()
 			dec := firewall.Evaluate(query, profile)
 			proxyOverhead += time.Since(t0)
-			primarySQL = query
-			primaryDec = dec
-			hasQuery = true
+			inspected = append(inspected, inspectedStmt{sql: query, dec: dec})
 		case pgwire.MsgDescribe:
 			if len(m.payload) >= 2 && m.payload[0] == 'S' {
 				activeStmtName = pgwire.ParseSimpleQuery(m.payload[1:])
@@ -446,14 +472,13 @@ func (s *Server) handleExtendedBatch(
 				// (pgx/v5, psycopg3, JDBC) keep native binary framing for int4/uuid/timestamp while
 				// pgveil masks UTF-8 string OIDs seamlessly in both text and binary wire formats.
 				activeStmtName = stmtName
-				if !hasQuery {
+				// Re-evaluate cached prepared statements not freshly parsed in this same batch
+				if !parsedInBatch[stmtName] {
 					if cachedSQL, ok := meta.prepStmts[stmtName]; ok && cachedSQL != "" {
 						t0 := time.Now()
 						dec := firewall.Evaluate(cachedSQL, profile)
 						proxyOverhead += time.Since(t0)
-						primarySQL = cachedSQL
-						primaryDec = dec
-						hasQuery = true
+						inspected = append(inspected, inspectedStmt{sql: cachedSQL, dec: dec})
 					}
 				}
 			}
@@ -466,39 +491,64 @@ func (s *Server) handleExtendedBatch(
 		}
 	}
 
+	var primarySQL string
+	var primaryDec firewall.Decision
+	hasQuery := len(inspected) > 0
 	hitlOutcome := ""
-	if hasQuery {
-		if rl := s.checkRateLimit(meta, profile, primaryDec.Fingerprint); !rl.Allowed {
-			primaryDec.Rule = rl.Rule
-			primaryDec.Reason = rl.Reason
-			primaryDec.RiskLevel = "HIGH"
-			if !profile.IsAuditOnly() {
-				s.recordAndEmitBlocked(span, meta, profile, primarySQL, primaryDec, "BLOCKED", proxyOverhead)
-				return s.sendBlockedErrorCode(clientW, meta.txStatus, "53300", rl.Reason, fmt.Sprintf("rule=%s profile=%s", rl.Rule, profile.Name), "Slow down query frequency or break agent retry loop")
-			}
-			hitlOutcome = "WOULD_BLOCK"
-		}
-		switch primaryDec.Action {
-		case firewall.ActionBlock:
-			if profile.IsAuditOnly() {
-				hitlOutcome = "WOULD_BLOCK"
-			} else {
-				s.recordAndEmitBlocked(span, meta, profile, primarySQL, primaryDec, "BLOCKED", proxyOverhead)
-				return s.sendBlockedError(clientW, meta.txStatus, primaryDec.Reason, fmt.Sprintf("rule=%s profile=%s", primaryDec.Rule, profile.Name), "Blocked by pgveil AST SQL Firewall")
-			}
 
-		case firewall.ActionRequireHITL:
-			if profile.IsAuditOnly() {
-				hitlOutcome = "WOULD_HITL"
-			} else {
-				approved, outcome, detail := s.handleHITL(spanCtx, meta, profile, primarySQL, primaryDec)
+	if hasQuery {
+		// Default to the last statement for column provenance / audit metadata,
+		// unless any statement in the batch is BLOCKED or requires HITL (strictest wins!).
+		primarySQL = inspected[len(inspected)-1].sql
+		primaryDec = inspected[len(inspected)-1].dec
+
+		for _, item := range inspected {
+			if rl := s.checkRateLimit(meta, profile, item.dec.Fingerprint); !rl.Allowed {
+				dec := item.dec
+				dec.Rule = rl.Rule
+				dec.Reason = rl.Reason
+				dec.RiskLevel = "HIGH"
+				if !profile.IsAuditOnly() {
+					s.recordAndEmitBlocked(span, meta, profile, item.sql, dec, "BLOCKED", proxyOverhead)
+					return s.sendBlockedErrorCode(clientW, meta.txStatus, "53300", rl.Reason, fmt.Sprintf("rule=%s profile=%s", rl.Rule, profile.Name), "Slow down query frequency or break agent retry loop")
+				}
+				hitlOutcome = "WOULD_BLOCK"
+				primarySQL = item.sql
+				primaryDec = dec
+			}
+			if item.dec.Action == firewall.ActionBlock {
+				primarySQL = item.sql
+				primaryDec = item.dec
+				if profile.IsAuditOnly() {
+					hitlOutcome = "WOULD_BLOCK"
+					continue
+				}
+				s.recordAndEmitBlocked(span, meta, profile, item.sql, item.dec, "BLOCKED", proxyOverhead)
+				return s.sendBlockedError(clientW, meta.txStatus, item.dec.Reason, fmt.Sprintf("rule=%s profile=%s", item.dec.Rule, profile.Name), "Blocked by pgveil AST SQL Firewall")
+			}
+		}
+		for _, item := range inspected {
+			if item.dec.Action == firewall.ActionRequireHITL {
+				primarySQL = item.sql
+				primaryDec = item.dec
+				if profile.IsAuditOnly() {
+					hitlOutcome = "WOULD_HITL"
+					continue
+				}
+				approved, outcome, detail := s.handleHITL(spanCtx, meta, profile, item.sql, item.dec)
 				hitlOutcome = outcome
 				if !approved {
-					s.recordAndEmitBlocked(span, meta, profile, primarySQL, primaryDec, outcome, proxyOverhead)
-					return s.sendBlockedError(clientW, meta.txStatus, detail, fmt.Sprintf("rule=%s profile=%s status=%s", primaryDec.Rule, profile.Name, outcome), "Approve pending query in the pgveil Web Console")
+					s.recordAndEmitBlocked(span, meta, profile, item.sql, item.dec, outcome, proxyOverhead)
+					return s.sendBlockedError(clientW, meta.txStatus, detail, fmt.Sprintf("rule=%s profile=%s status=%s", item.dec.Rule, profile.Name, outcome), "Approve pending query in the pgveil Web Console")
 				}
 			}
 		}
+	}
+
+	// Only cache parsed statements in session metadata AFTER every statement in the batch passed policy!
+	for _, ps := range pendingStmts {
+		meta.prepStmts[ps.name] = ps.query
+		delete(meta.stmtFields, ps.name)
 	}
 
 	upstreamStart := time.Now()
@@ -508,8 +558,8 @@ func (s *Server) handleExtendedBatch(
 		}
 	}
 	if !hasSync {
-		// Flush-only cycle without Sync: read until ParseComplete/BindComplete/NoData/RowDescription/PortalSuspended
-		return s.relayUntilFlush(clientW, upstreamR)
+		// Flush-only cycle without Sync: relay every response expected for the requests in this batch
+		return s.relayUntilFlush(clientW, upstreamR, meta, activeStmtName, batch)
 	}
 	if !hasQuery {
 		primaryDec = firewall.Decision{Action: firewall.ActionAllow, StatementType: "EXTENDED", RiskLevel: "LOW", Rule: "policy_allow"}
@@ -517,12 +567,49 @@ func (s *Server) handleExtendedBatch(
 	return s.relayResponseCycle(span, clientW, upstreamR, meta, profile, primarySQL, activeStmtName, primaryDec, hitlOutcome, proxyOverhead, upstreamStart)
 }
 
-func (s *Server) relayUntilFlush(clientW io.Writer, upstreamR io.Reader) error {
-	mType, payload, err := pgwire.ReadMessage(upstreamR)
-	if err != nil {
-		return err
+func (s *Server) relayUntilFlush(clientW io.Writer, upstreamR io.Reader, meta *sessionMeta, stmtName string, batch []wireMsg) error {
+	expected := 0
+	for _, m := range batch {
+		switch m.msgType {
+		case pgwire.MsgParse, pgwire.MsgBind, pgwire.MsgClose:
+			expected++
+		case pgwire.MsgDescribe:
+			if len(m.payload) >= 1 && m.payload[0] == 'S' {
+				expected += 2 // ParameterDescription ('t') + RowDescription ('T') or NoData ('n')
+			} else {
+				expected++ // Portal describe: RowDescription ('T') or NoData ('n')
+			}
+		case pgwire.MsgExecute:
+			expected++ // Terminal CommandComplete ('C') / PortalSuspended ('s') / EmptyQuery ('I')
+		}
 	}
-	return pgwire.WriteMessage(clientW, mType, payload)
+	if expected == 0 {
+		expected = 1
+	}
+	completed := 0
+	for completed < expected {
+		mType, payload, err := pgwire.ReadMessage(upstreamR)
+		if err != nil {
+			return err
+		}
+		if mType == pgwire.MsgRowDescription && stmtName != "" {
+			if parsed, perr := pgwire.ParseRowDescription(payload); perr == nil {
+				meta.stmtFields[stmtName] = parsed
+			}
+		}
+		if err := pgwire.WriteMessage(clientW, mType, payload); err != nil {
+			return err
+		}
+		switch mType {
+		case pgwire.MsgParseComplete, pgwire.MsgBindComplete, pgwire.MsgCloseComplete,
+			pgwire.MsgParameterDescription, pgwire.MsgRowDescription, pgwire.MsgNoData,
+			pgwire.MsgCommandComplete, pgwire.MsgPortalSuspended, pgwire.MsgEmptyQuery:
+			completed++
+		case pgwire.MsgErrorResponse:
+			return nil
+		}
+	}
+	return nil
 }
 
 func isUTF8TextOID(oid uint32) bool {
@@ -558,15 +645,37 @@ func (s *Server) relayResponseCycle(
 
 	var fields []pgwire.FieldDescription
 	var colStrategies []pii.Strategy
+	var colHintNames []string
 	anyColRule := false
 
 	initFieldStrategies := func(fds []pgwire.FieldDescription) {
 		fields = fds
 		colStrategies = make([]pii.Strategy, len(fields))
+		colHintNames = make([]string, len(fields))
 		anyColRule = false
 		if maskingEnabled {
 			for i, f := range fields {
+				colHintNames[i] = f.Name
 				st := profile.ColumnStrategy(f.Name)
+				// AST projection provenance: prevent column-alias masking bypasses (e.g. SELECT full_name AS fn)
+				if st == "" && i < len(dec.TargetSources) {
+					for _, src := range dec.TargetSources[i] {
+						if srcStrat := profile.ColumnStrategy(src); srcStrat != "" {
+							st = srcStrat
+							colHintNames[i] = src
+							break
+						}
+					}
+				}
+				if st == "" && len(dec.AliasSources) > 0 {
+					for _, src := range dec.AliasSources[strings.ToLower(f.Name)] {
+						if srcStrat := profile.ColumnStrategy(src); srcStrat != "" {
+							st = srcStrat
+							colHintNames[i] = src
+							break
+						}
+					}
+				}
 				colStrategies[i] = st
 				if st != "" {
 					anyColRule = true
@@ -636,7 +745,8 @@ func (s *Server) relayResponseCycle(
 						}
 						rawVal := string(cols[i])
 						strat := colStrategies[i]
-						maskedVal, setNull, found := masker.MaskColumn(fields[i].Name, rawVal, strat, autoDetect, enabledEntities)
+						hintCol := colHintNames[i]
+						maskedVal, setNull, found := masker.MaskColumn(hintCol, rawVal, strat, autoDetect, enabledEntities)
 						if setNull {
 							cols[i] = nil
 							changed = true
@@ -756,6 +866,7 @@ func (s *Server) handleHITL(
 	}, timeout)
 
 	if profile.Firewall.HITLMode == "reject" {
+		_, _ = s.hitlMgr.Resolve(req.ID, false, "policy:reject-mode", dec.Reason)
 		if s.metrics != nil {
 			s.metrics.HITLDecisions.WithLabelValues(profile.Name, "rejected_immediate").Inc()
 		}

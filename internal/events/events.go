@@ -85,6 +85,7 @@ type Bus struct {
 	kafkaCh     chan AuditEvent
 	metrics     *telemetry.Metrics
 	stopCh      chan struct{}
+	closeOnce   sync.Once
 	wg          sync.WaitGroup
 }
 
@@ -135,8 +136,8 @@ func (b *Bus) Publish(ev AuditEvent) {
 	if ev.OccurredAt.IsZero() {
 		ev.OccurredAt = time.Now().UTC()
 	}
-	if len(ev.RawSQLPreview) > 500 {
-		ev.RawSQLPreview = ev.RawSQLPreview[:500] + "..."
+	if r := []rune(ev.RawSQLPreview); len(r) > 500 {
+		ev.RawSQLPreview = string(r[:500]) + "..."
 	}
 
 	b.mu.Lock()
@@ -300,13 +301,15 @@ func (b *Bus) Subscribe() (<-chan AuditEvent, func()) {
 	}
 }
 
-// Close flushes and shuts down the async Kafka producer.
+// Close flushes and shuts down the async Kafka producer safely (idempotent).
 func (b *Bus) Close() {
-	close(b.stopCh)
-	b.wg.Wait()
-	if b.kafkaClient != nil {
-		b.kafkaClient.Close()
-	}
+	b.closeOnce.Do(func() {
+		close(b.stopCh)
+		b.wg.Wait()
+		if b.kafkaClient != nil {
+			b.kafkaClient.Close()
+		}
+	})
 }
 
 func copyMap(m map[string]int64) map[string]int64 {

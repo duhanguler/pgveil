@@ -92,6 +92,14 @@ func (l *Limiter) Check(key, fingerprint string, maxQPM, loopThreshold int, loop
 	// 2. Runaway AI-Agent Loop Circuit Breaker (identical fingerprint burst)
 	if loopThreshold > 0 && fingerprint != "" && fingerprint != "unparseable" {
 		cutoff := now.Add(-loopWindow)
+		// Lazily prune expired fingerprints inside long-lived client buckets to bound memory
+		if len(b.fpTimes) > 512 {
+			for fpKey, times := range b.fpTimes {
+				if len(times) == 0 || !times[len(times)-1].After(cutoff) {
+					delete(b.fpTimes, fpKey)
+				}
+			}
+		}
 		hist := b.fpTimes[fingerprint]
 		kept := hist[:0]
 		for _, ts := range hist {

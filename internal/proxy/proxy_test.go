@@ -91,6 +91,14 @@ func sendFakeResult(w io.Writer, sql string) {
 		_ = pgwire.WriteMessage(w, pgwire.MsgCommandComplete, pgwire.BuildCommandComplete("UPDATE 1"))
 		return
 	}
+	if strings.Contains(sql, "DISPLAY_NAME") {
+		rowDesc := encodeRowDesc([]string{"id", "display_name"})
+		_ = pgwire.WriteMessage(w, pgwire.MsgRowDescription, rowDesc)
+		dr := pgwire.EncodeDataRow([][]byte{[]byte("1"), []byte("Ahmet Yılmaz")})
+		_ = pgwire.WriteMessage(w, pgwire.MsgDataRow, dr)
+		_ = pgwire.WriteMessage(w, pgwire.MsgCommandComplete, pgwire.BuildCommandComplete("SELECT 1"))
+		return
+	}
 	// Return 40 synthetic PII rows for customers query
 	rowDesc := encodeRowDesc([]string{"id", "email", "tckn", "iban", "note"})
 	_ = pgwire.WriteMessage(w, pgwire.MsgRowDescription, rowDesc)
@@ -336,5 +344,123 @@ func TestShadowAuditModeAndRunawayLoopBreaker(t *testing.T) {
 	recent := bus.Recent(5, "WOULD_BLOCK", "analyst")
 	if len(recent) == 0 {
 		t.Fatalf("expected WOULD_BLOCK audit event in shadow mode, recent=%+v", bus.Recent(5, "", "analyst"))
+	}
+}
+
+func TestWireSecurityRegressions_FastPathAliasAndPipelineBypass(t *testing.T) {
+	pgAddr, stopPG := startFakePostgres(t)
+	defer stopPG()
+
+	mgr, err := policy.LoadFile("../../configs/pgveil.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := mgr.Config()
+	cfg.Server.ListenAddr = "127.0.0.1:0"
+	cfg.Server.UpstreamAddr = pgAddr
+
+	bus := events.NewBus(100, policy.KafkaConfig{}, nil)
+	defer bus.Close()
+	srv, err := NewServer(mgr, hitl.NewManager(20), bus, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = srv.Start(ctx) }()
+
+	var proxyAddr string
+	for i := 0; i < 50; i++ {
+		if a := srv.Addr(); a != "" {
+			proxyAddr = a
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// 1. Raw wire test: Fast-Path FunctionCall ('F') MUST be blocked & Pipelined Parse(DROP) + Parse(SELECT 1) + Sync MUST be blocked!
+	conn, err := net.DialTimeout("tcp", proxyAddr, 2*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+
+	// Send StartupMessage v3.0 (user=pgveil, database=pgveil_demo, application_name=ai_agent)
+	var startupBody []byte
+	startupBody = append(startupBody, 0, 3, 0, 0) // 196608
+	for _, kv := range [][2]string{{"user", "pgveil"}, {"database", "pgveil_demo"}, {"application_name", "ai_agent"}} {
+		startupBody = append(startupBody, []byte(kv[0])...)
+		startupBody = append(startupBody, 0)
+		startupBody = append(startupBody, []byte(kv[1])...)
+		startupBody = append(startupBody, 0)
+	}
+	startupBody = append(startupBody, 0)
+	startup := make([]byte, 4+len(startupBody))
+	binary.BigEndian.PutUint32(startup[0:4], uint32(len(startup)))
+	copy(startup[4:], startupBody)
+	if _, err := conn.Write(startup); err != nil {
+		t.Fatal(err)
+	}
+	for {
+		mt, _, err := pgwire.ReadMessage(conn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if mt == pgwire.MsgReadyForQuery {
+			break
+		}
+	}
+
+	// 1a. Legacy Fast-Path FunctionCall ('F') frame MUST return ErrorResponse + ReadyForQuery
+	if err := pgwire.WriteMessage(conn, pgwire.MsgFunctionCall, []byte{0, 0, 0, 1, 0, 0, 0, 0, 0, 0}); err != nil {
+		t.Fatal(err)
+	}
+	mt, payload, err := pgwire.ReadMessage(conn)
+	if err != nil || mt != pgwire.MsgErrorResponse || !strings.Contains(string(payload), "FunctionCall") {
+		t.Fatalf("expected Fast-Path FunctionCall block, got type=%q payload=%q err=%v", mt, string(payload), err)
+	}
+	if mt, _, err := pgwire.ReadMessage(conn); err != nil || mt != pgwire.MsgReadyForQuery {
+		t.Fatalf("expected ReadyForQuery after FunctionCall error, got %q err=%v", mt, err)
+	}
+
+	// 1b. Pipelined Extended Query Bypass: Parse("DROP TABLE orders") + Parse("SELECT 1") + Sync MUST be BLOCKED!
+	buildParse := func(stmt, q string) []byte {
+		var p []byte
+		p = append(p, []byte(stmt)...)
+		p = append(p, 0)
+		p = append(p, []byte(q)...)
+		p = append(p, 0, 0, 0)
+		return p
+	}
+	_ = pgwire.WriteMessage(conn, pgwire.MsgParse, buildParse("s1", "DROP TABLE orders"))
+	_ = pgwire.WriteMessage(conn, pgwire.MsgParse, buildParse("s2", "SELECT 1"))
+	_ = pgwire.WriteMessage(conn, pgwire.MsgSync, nil)
+
+	mt, payload, err = pgwire.ReadMessage(conn)
+	if err != nil || mt != pgwire.MsgErrorResponse || !strings.Contains(string(payload), "block_ddl") {
+		t.Fatalf("pipelined DROP TABLE bypassed firewall! got type=%q payload=%q err=%v", mt, string(payload), err)
+	}
+	if mt, _, err := pgwire.ReadMessage(conn); err != nil || mt != pgwire.MsgReadyForQuery {
+		t.Fatalf("expected ReadyForQuery after pipelined block, got %q err=%v", mt, err)
+	}
+
+	// 2. Column-alias masking bypass test: `SELECT id, full_name AS display_name FROM customers`
+	// Even though RowDescription sends column name "display_name", AST provenance MUST apply `full_name: hash`!
+	dsnAI := "postgres://pgveil:pw@" + proxyAddr + "/pgveil_demo?sslmode=disable&application_name=ai_agent"
+	ccAI, _ := pgx.ParseConfig(dsnAI)
+	ccAI.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	cAI, err := pgx.ConnectConfig(ctx, ccAI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cAI.Close(ctx)
+
+	var id, displayName string
+	if err := cAI.QueryRow(ctx, "SELECT id, full_name AS display_name FROM customers LIMIT 1").Scan(&id, &displayName); err != nil {
+		t.Fatalf("aliased query failed: %v", err)
+	}
+	if strings.Contains(displayName, "Ahmet") || !strings.HasPrefix(displayName, "tok_") {
+		t.Fatalf("column alias bypassed full_name hash masking! got display_name=%q", displayName)
 	}
 }

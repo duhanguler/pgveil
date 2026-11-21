@@ -19,51 +19,97 @@ const (
 
 // Decision holds the full AST inspection result for policy enforcement and auditing.
 type Decision struct {
-	Action        Action   `json:"action"`
-	StatementType string   `json:"statement_type"`
-	RiskLevel     string   `json:"risk_level"` // LOW, MEDIUM, HIGH, CRITICAL
-	Reason        string   `json:"reason"`
-	Rule          string   `json:"rule"`
-	Tables        []string `json:"tables"`
-	Fingerprint   string   `json:"fingerprint"`
-	HasSelectStar bool     `json:"has_select_star"`
+	Action        Action              `json:"action"`
+	StatementType string              `json:"statement_type"`
+	RiskLevel     string              `json:"risk_level"` // LOW, MEDIUM, HIGH, CRITICAL
+	Reason        string              `json:"reason"`
+	Rule          string              `json:"rule"`
+	Tables        []string            `json:"tables"`
+	Fingerprint   string              `json:"fingerprint"`
+	HasSelectStar bool                `json:"has_select_star"`
+	TargetSources [][]string          `json:"-"` // Positional source column provenance per SELECT target (prevents alias masking bypasses)
+	AliasSources  map[string][]string `json:"-"` // Lowercased output alias -> referenced source columns
 }
 
 // dangerousFunctions are PostgreSQL server-side functions that enable filesystem read/write,
-// OS command execution, SSRF/lateral movement, or DoS.
+// OS command execution, SSRF/lateral movement, denied-table bypasses, privilege escalation, or DoS.
 var dangerousFunctions = map[string]bool{
-	"pg_read_file":              true,
-	"pg_read_binary_file":       true,
-	"pg_ls_dir":                 true,
-	"pg_ls_logdir":              true,
-	"pg_ls_waldir":              true,
-	"pg_stat_file":              true,
-	"pg_execute_server_program": true,
-	"lo_import":                 true,
-	"lo_export":                 true,
-	"lo_from_bytea":             true,
-	"lo_put":                    true,
-	"dblink":                    true,
-	"dblink_exec":               true,
-	"dblink_connect":            true,
-	"dblink_connect_u":          true,
-	"query_to_xml":              true,
-	"pg_terminate_backend":      true,
-	"pg_cancel_backend":         true,
-	"pg_reload_conf":            true,
-	"pg_rotate_logfile":         true,
-	"pg_switch_wal":             true,
+	"pg_read_file":                       true,
+	"pg_read_binary_file":                true,
+	"pg_ls_dir":                          true,
+	"pg_ls_logdir":                       true,
+	"pg_ls_waldir":                       true,
+	"pg_ls_tmpdir":                       true,
+	"pg_ls_archive_statusdir":            true,
+	"pg_ls_logicalmapdir":                true,
+	"pg_ls_logicalsnapdir":               true,
+	"pg_ls_replslotdir":                  true,
+	"pg_stat_file":                       true,
+	"pg_execute_server_program":          true,
+	"lo_import":                          true,
+	"lo_export":                          true,
+	"lo_from_bytea":                      true,
+	"lo_put":                             true,
+	"lo_get":                             true,
+	"lo_open":                            true,
+	"lo_create":                          true,
+	"lo_unlink":                          true,
+	"loread":                             true,
+	"lowrite":                            true,
+	"dblink":                             true,
+	"dblink_exec":                        true,
+	"dblink_connect":                     true,
+	"dblink_connect_u":                   true,
+	"query_to_xml":                       true,
+	"query_to_xmlschema":                 true,
+	"query_to_xml_and_xmlschema":         true,
+	"table_to_xml":                       true,
+	"table_to_xmlschema":                 true,
+	"table_to_xml_and_xmlschema":         true,
+	"schema_to_xml":                      true,
+	"schema_to_xmlschema":                true,
+	"schema_to_xml_and_xmlschema":        true,
+	"database_to_xml":                    true,
+	"database_to_xmlschema":              true,
+	"database_to_xml_and_xmlschema":      true,
+	"cursor_to_xml":                      true,
+	"cursor_to_xmlschema":                true,
+	"set_config":                         true,
+	"pg_terminate_backend":               true,
+	"pg_cancel_backend":                  true,
+	"pg_reload_conf":                     true,
+	"pg_rotate_logfile":                  true,
+	"pg_switch_wal":                      true,
+	"pg_export_snapshot":                 true,
+	"pg_logical_emit_message":            true,
+	"pg_logical_slot_get_changes":        true,
+	"pg_logical_slot_peek_changes":       true,
+	"pg_logical_slot_get_binary_changes": true,
+	"pg_sleep":                           true,
+	"pg_sleep_for":                       true,
+	"pg_sleep_until":                     true,
 }
 
-// sensitiveSystemTables contain credential hashes or sensitive server internals.
+// sensitiveSystemTables contain credential hashes, raw planner PII samples (pg_stats),
+// live cross-session SQL queries (pg_stat_activity), or sensitive server internals.
 var sensitiveSystemTables = map[string]bool{
-	"pg_shadow":        true,
-	"pg_authid":        true,
-	"pg_auth_members":  true,
-	"pg_roles":         true,
-	"pg_user":          true,
-	"pg_file_settings": true,
-	"pg_hba_file_rules": true,
+	"pg_shadow":             true,
+	"pg_authid":             true,
+	"pg_auth_members":       true,
+	"pg_roles":              true,
+	"pg_user":               true,
+	"pg_file_settings":      true,
+	"pg_hba_file_rules":     true,
+	"pg_stats":              true,
+	"pg_statistic":          true,
+	"pg_statistic_ext_data": true,
+	"pg_stat_activity":      true,
+	"pg_stat_statements":    true,
+	"pg_settings":           true,
+	"pg_config":             true,
+	"pg_prepared_statements": true,
+	"pg_cursors":            true,
+	"pg_shmem_allocations":  true,
 }
 
 // safeClientHousekeepingStatements are non-data session commands sent automatically by drivers (pgx, psql, psycopg).
@@ -143,11 +189,14 @@ func Evaluate(sql string, profile *policy.RoleProfile) Decision {
 	}
 
 	analysis := analyzeAST(tree)
+	targetSources, aliasSources := extractTargetProvenance(tree)
 	dec := Decision{
 		StatementType: analysis.primaryType,
 		Tables:        analysis.tables,
 		Fingerprint:   fp,
 		HasSelectStar: analysis.hasSelectStar,
+		TargetSources: targetSources,
+		AliasSources:  aliasSources,
 		RiskLevel:     "LOW",
 	}
 
@@ -355,10 +404,17 @@ func analyzeAST(tree *pg_query.ParseResult) astAnalysis {
 		case *pg_query.Node_SelectStmt:
 			s := inner.SelectStmt
 			addType("SELECT")
+			if s.IntoClause != nil {
+				res.isDDL = true
+				addTable(s.IntoClause.Rel)
+			}
 			if s.WithClause != nil {
 				for _, cte := range s.WithClause.Ctes {
 					walkNode(cte)
 				}
+			}
+			for _, d := range s.DistinctClause {
+				walkNode(d)
 			}
 			for _, tl := range s.TargetList {
 				walkNode(tl)
@@ -371,6 +427,15 @@ func analyzeAST(tree *pg_query.ParseResult) astAnalysis {
 				walkNode(g)
 			}
 			walkNode(s.HavingClause)
+			for _, w := range s.WindowClause {
+				walkNode(w)
+			}
+			for _, vl := range s.ValuesLists {
+				walkNode(vl)
+			}
+			for _, sc := range s.SortClause {
+				walkNode(sc)
+			}
 			walkNode(s.LimitCount)
 			walkNode(s.LimitOffset)
 			if s.Larg != nil {
@@ -510,9 +575,78 @@ func analyzeAST(tree *pg_query.ParseResult) astAnalysis {
 		case *pg_query.Node_VariableSetStmt:
 			addType("SET")
 			vname := strings.ToLower(inner.VariableSetStmt.Name)
-			if vname == "role" || vname == "session_authorization" {
+			if vname == "role" || vname == "session_authorization" ||
+				vname == "row_security" || vname == "session_replication_role" ||
+				vname == "default_transaction_read_only" ||
+				inner.VariableSetStmt.Kind == pg_query.VariableSetKind_VAR_RESET_ALL {
 				res.hasRoleEscalation = true
 			}
+
+		case *pg_query.Node_PrepareStmt:
+			addType("PREPARE")
+			walkNode(inner.PrepareStmt.Query)
+
+		case *pg_query.Node_ExecuteStmt:
+			addType("EXECUTE")
+
+		case *pg_query.Node_CallStmt:
+			addType("CALL")
+			if inner.CallStmt.Funccall != nil {
+				addFunc(inner.CallStmt.Funccall)
+				for _, arg := range inner.CallStmt.Funccall.Args {
+					walkNode(arg)
+				}
+			}
+
+		case *pg_query.Node_MergeStmt:
+			addType("MERGE")
+			addTable(inner.MergeStmt.Relation)
+			walkNode(inner.MergeStmt.SourceRelation)
+			walkNode(inner.MergeStmt.JoinCondition)
+			if inner.MergeStmt.WithClause != nil {
+				for _, cte := range inner.MergeStmt.WithClause.Ctes {
+					walkNode(cte)
+				}
+			}
+			for _, mc := range inner.MergeStmt.MergeWhenClauses {
+				walkNode(mc)
+			}
+
+		case *pg_query.Node_MergeWhenClause:
+			walkNode(inner.MergeWhenClause.Condition)
+			for _, t := range inner.MergeWhenClause.TargetList {
+				walkNode(t)
+			}
+			for _, v := range inner.MergeWhenClause.Values {
+				walkNode(v)
+			}
+
+		case *pg_query.Node_DeclareCursorStmt:
+			addType("DECLARE_CURSOR")
+			walkNode(inner.DeclareCursorStmt.Query)
+
+		case *pg_query.Node_FetchStmt:
+			addType("FETCH")
+
+		case *pg_query.Node_CreateTableAsStmt:
+			addType("CREATE_TABLE_AS")
+			res.isDDL = true
+			if inner.CreateTableAsStmt.Into != nil {
+				addTable(inner.CreateTableAsStmt.Into.Rel)
+			}
+			walkNode(inner.CreateTableAsStmt.Query)
+
+		case *pg_query.Node_CreateRoleStmt, *pg_query.Node_AlterRoleStmt, *pg_query.Node_DropRoleStmt,
+			*pg_query.Node_CreateExtensionStmt, *pg_query.Node_CreateTrigStmt, *pg_query.Node_CreatePolicyStmt,
+			*pg_query.Node_RuleStmt, *pg_query.Node_AlterDefaultPrivilegesStmt, *pg_query.Node_RefreshMatViewStmt,
+			*pg_query.Node_VacuumStmt, *pg_query.Node_ReindexStmt, *pg_query.Node_ClusterStmt, *pg_query.Node_LockStmt:
+			addType("DDL")
+			res.isDDL = true
+
+		case *pg_query.Node_LoadStmt:
+			addType("LOAD")
+			res.isDDL = true
+			res.hasCopyProgram = true
 
 		case *pg_query.Node_TransactionStmt:
 			switch inner.TransactionStmt.Kind {
@@ -570,6 +704,23 @@ func analyzeAST(tree *pg_query.ParseResult) astAnalysis {
 			for _, arg := range inner.FuncCall.Args {
 				walkNode(arg)
 			}
+			walkNode(inner.FuncCall.AggFilter)
+			if inner.FuncCall.Over != nil {
+				walkNode(&pg_query.Node{Node: &pg_query.Node_WindowDef{WindowDef: inner.FuncCall.Over}})
+			}
+
+		case *pg_query.Node_WindowDef:
+			for _, p := range inner.WindowDef.PartitionClause {
+				walkNode(p)
+			}
+			for _, o := range inner.WindowDef.OrderClause {
+				walkNode(o)
+			}
+			walkNode(inner.WindowDef.StartOffset)
+			walkNode(inner.WindowDef.EndOffset)
+
+		case *pg_query.Node_SortBy:
+			walkNode(inner.SortBy.Node)
 
 		case *pg_query.Node_AExpr:
 			walkNode(inner.AExpr.Lexpr)
@@ -603,6 +754,36 @@ func analyzeAST(tree *pg_query.ParseResult) astAnalysis {
 				walkNode(a)
 			}
 
+		case *pg_query.Node_MinMaxExpr:
+			for _, a := range inner.MinMaxExpr.Args {
+				walkNode(a)
+			}
+
+		case *pg_query.Node_NullTest:
+			walkNode(inner.NullTest.Arg)
+
+		case *pg_query.Node_BooleanTest:
+			walkNode(inner.BooleanTest.Arg)
+
+		case *pg_query.Node_NamedArgExpr:
+			walkNode(inner.NamedArgExpr.Arg)
+
+		case *pg_query.Node_AArrayExpr:
+			for _, el := range inner.AArrayExpr.Elements {
+				walkNode(el)
+			}
+
+		case *pg_query.Node_RowExpr:
+			for _, a := range inner.RowExpr.Args {
+				walkNode(a)
+			}
+
+		case *pg_query.Node_AIndirection:
+			walkNode(inner.AIndirection.Arg)
+			for _, ind := range inner.AIndirection.Indirection {
+				walkNode(ind)
+			}
+
 		case *pg_query.Node_List:
 			for _, item := range inner.List.Items {
 				walkNode(item)
@@ -631,7 +812,7 @@ func analyzeAST(tree *pg_query.ParseResult) astAnalysis {
 }
 
 // isTautology detects trivially always-true WHERE predicates such as WHERE true, WHERE 1=1,
-// WHERE 'a'='a', or WHERE cond OR 1=1 (common SQL injection / AI agent bypasses).
+// WHERE 2>1, WHERE 1<>2, WHERE id=id, WHERE NOT (1=2), or WHERE cond OR 1=1.
 func isTautology(n *pg_query.Node) bool {
 	if n == nil {
 		return true
@@ -665,41 +846,153 @@ func isTautology(n *pg_query.Node) bool {
 			return allTrue
 		case pg_query.BoolExprType_NOT_EXPR:
 			if len(v.BoolExpr.Args) == 1 {
-				if ac := v.BoolExpr.Args[0].GetAConst(); ac != nil {
-					if b := ac.GetBoolval(); b != nil && !b.Boolval {
+				return isContradiction(v.BoolExpr.Args[0])
+			}
+		}
+	case *pg_query.Node_AExpr:
+		switch v.AExpr.Kind {
+		case pg_query.A_Expr_Kind_AEXPR_OP:
+			if len(v.AExpr.Name) == 1 {
+				if op := v.AExpr.Name[0].GetString_(); op != nil {
+					if evalConstComparison(op.Sval, v.AExpr.Lexpr, v.AExpr.Rexpr) == 1 {
+						return true
+					}
+					if (op.Sval == "=" || op.Sval == ">=" || op.Sval == "<=") && sameColumnRef(v.AExpr.Lexpr, v.AExpr.Rexpr) {
 						return true
 					}
 				}
 			}
-		}
-	case *pg_query.Node_AExpr:
-		if v.AExpr.Kind == pg_query.A_Expr_Kind_AEXPR_OP && len(v.AExpr.Name) == 1 {
-			if op := v.AExpr.Name[0].GetString_(); op != nil && op.Sval == "=" {
-				return sameConstant(v.AExpr.Lexpr, v.AExpr.Rexpr)
+		case pg_query.A_Expr_Kind_AEXPR_IN:
+			// Catch WHERE 1 IN (1, 2)
+			if list := v.AExpr.Rexpr.GetList(); list != nil && v.AExpr.Lexpr.GetAConst() != nil {
+				for _, item := range list.Items {
+					if sameConstant(v.AExpr.Lexpr, item) {
+						return true
+					}
+				}
 			}
 		}
 	}
 	return false
 }
 
-func sameConstant(a, b *pg_query.Node) bool {
-	if a == nil || b == nil {
+func isContradiction(n *pg_query.Node) bool {
+	if n == nil {
 		return false
+	}
+	switch v := n.Node.(type) {
+	case *pg_query.Node_AConst:
+		if b := v.AConst.GetBoolval(); b != nil && !b.Boolval {
+			return true
+		}
+		if iv := v.AConst.GetIval(); iv != nil && iv.Ival == 0 {
+			return true
+		}
+	case *pg_query.Node_TypeCast:
+		return isContradiction(v.TypeCast.Arg)
+	case *pg_query.Node_AExpr:
+		if v.AExpr.Kind == pg_query.A_Expr_Kind_AEXPR_OP && len(v.AExpr.Name) == 1 {
+			if op := v.AExpr.Name[0].GetString_(); op != nil {
+				return evalConstComparison(op.Sval, v.AExpr.Lexpr, v.AExpr.Rexpr) == -1
+			}
+		}
+	}
+	return false
+}
+
+// evalConstComparison returns 1 if constant op evaluates true, -1 if false, 0 if non-constant/unknown.
+func evalConstComparison(op string, a, b *pg_query.Node) int {
+	if a == nil || b == nil {
+		return 0
 	}
 	ac, bc := a.GetAConst(), b.GetAConst()
 	if ac == nil || bc == nil {
-		return false
+		return 0
 	}
 	if ai, bi := ac.GetIval(), bc.GetIval(); ai != nil && bi != nil {
-		return ai.Ival == bi.Ival
+		l, r := ai.Ival, bi.Ival
+		var ok bool
+		switch op {
+		case "=":
+			ok = l == r
+		case "<>", "!=":
+			ok = l != r
+		case ">":
+			ok = l > r
+		case ">=":
+			ok = l >= r
+		case "<":
+			ok = l < r
+		case "<=":
+			ok = l <= r
+		default:
+			return 0
+		}
+		if ok {
+			return 1
+		}
+		return -1
 	}
 	if as, bs := ac.GetSval(), bc.GetSval(); as != nil && bs != nil {
-		return as.Sval == bs.Sval
+		var ok bool
+		switch op {
+		case "=":
+			ok = as.Sval == bs.Sval
+		case "<>", "!=":
+			ok = as.Sval != bs.Sval
+		case ">":
+			ok = as.Sval > bs.Sval
+		case ">=":
+			ok = as.Sval >= bs.Sval
+		case "<":
+			ok = as.Sval < bs.Sval
+		case "<=":
+			ok = as.Sval <= bs.Sval
+		default:
+			return 0
+		}
+		if ok {
+			return 1
+		}
+		return -1
 	}
 	if ab, bb := ac.GetBoolval(), bc.GetBoolval(); ab != nil && bb != nil {
-		return ab.Boolval == bb.Boolval
+		var ok bool
+		switch op {
+		case "=":
+			ok = ab.Boolval == bb.Boolval
+		case "<>", "!=":
+			ok = ab.Boolval != bb.Boolval
+		default:
+			return 0
+		}
+		if ok {
+			return 1
+		}
+		return -1
 	}
-	return false
+	return 0
+}
+
+func sameColumnRef(a, b *pg_query.Node) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	ca, cb := a.GetColumnRef(), b.GetColumnRef()
+	if ca == nil || cb == nil || len(ca.Fields) == 0 || len(ca.Fields) != len(cb.Fields) {
+		return false
+	}
+	for i := range ca.Fields {
+		sa, sb := ca.Fields[i].GetString_(), cb.Fields[i].GetString_()
+		if sa == nil || sb == nil || !strings.EqualFold(sa.Sval, sb.Sval) {
+			return false
+		}
+	}
+	return true
+}
+
+func sameConstant(a, b *pg_query.Node) bool {
+	return evalConstComparison("=", a, b) == 1
 }
 
 func extractDropTable(obj *pg_query.Node, addTable func(*pg_query.RangeVar)) {
@@ -757,36 +1050,96 @@ func stripSchema(name string) string {
 	return name
 }
 
-// piiExfilFuncs are string/encoding/hashing functions that could slice or transform
-// a masked column into a new alias to evade wire-level column masking or leak bits.
+// piiExfilFuncs are string/encoding/hashing/aggregation functions that could slice, encode,
+// or transform a masked column to evade wire-level masking or leak raw bits.
 var piiExfilFuncs = map[string]bool{
-	"substring":      true,
-	"substr":         true,
-	"left":           true,
-	"right":          true,
-	"ascii":          true,
-	"length":         true,
-	"char_length":    true,
-	"octet_length":   true,
-	"md5":            true,
-	"encode":         true,
-	"decode":         true,
-	"split_part":     true,
-	"regexp_match":   true,
-	"regexp_matches": true,
-	"regexp_replace": true,
-	"regexp_substr":  true,
-	"reverse":        true,
-	"concat":         true,
-	"concat_ws":      true,
-	"overlay":        true,
-	"replace":        true,
-	"position":       true,
-	"strpos":         true,
-	"translate":      true,
-	"btrim":          true,
-	"ltrim":          true,
-	"rtrim":          true,
+	"substring":          true,
+	"substr":             true,
+	"left":               true,
+	"right":              true,
+	"ascii":              true,
+	"chr":                true,
+	"length":             true,
+	"char_length":        true,
+	"character_length":   true,
+	"octet_length":       true,
+	"bit_length":         true,
+	"md5":                true,
+	"sha256":             true,
+	"sha512":             true,
+	"digest":             true,
+	"encode":             true,
+	"decode":             true,
+	"convert_to":         true,
+	"convert":            true,
+	"to_hex":             true,
+	"split_part":         true,
+	"regexp_match":       true,
+	"regexp_matches":     true,
+	"regexp_replace":     true,
+	"regexp_substr":      true,
+	"regexp_count":       true,
+	"regexp_instr":       true,
+	"starts_with":        true,
+	"reverse":            true,
+	"concat":             true,
+	"concat_ws":          true,
+	"format":             true,
+	"overlay":            true,
+	"replace":            true,
+	"position":           true,
+	"strpos":             true,
+	"translate":          true,
+	"btrim":              true,
+	"ltrim":              true,
+	"rtrim":              true,
+	"trim":               true,
+	"upper":              true,
+	"lower":              true,
+	"initcap":            true,
+	"lpad":               true,
+	"rpad":               true,
+	"repeat":             true,
+	"quote_literal":      true,
+	"quote_nullable":     true,
+	"string_agg":         true,
+	"array_agg":          true,
+	"json_agg":           true,
+	"jsonb_agg":          true,
+	"to_json":            true,
+	"to_jsonb":           true,
+	"row_to_json":        true,
+	"json_build_object":  true,
+	"jsonb_build_object": true,
+	"min":                true,
+	"max":                true,
+}
+
+var riskyCastTypes = map[string]bool{
+	"bytea":   true,
+	"int2":    true,
+	"int4":    true,
+	"int8":    true,
+	"integer": true,
+	"bigint":  true,
+	"numeric": true,
+	"decimal": true,
+	"json":    true,
+	"jsonb":   true,
+	"bit":     true,
+	"varbit":  true,
+}
+
+func isRiskyCast(tc *pg_query.TypeCast) bool {
+	if tc == nil || tc.TypeName == nil {
+		return false
+	}
+	for _, n := range tc.TypeName.Names {
+		if s := n.GetString_(); s != nil && riskyCastTypes[strings.ToLower(s.Sval)] {
+			return true
+		}
+	}
+	return false
 }
 
 func resolveProtectedColumns(profile *policy.RoleProfile) map[string]bool {
@@ -811,8 +1164,8 @@ func resolveProtectedColumns(profile *policy.RoleProfile) map[string]bool {
 }
 
 // detectPIIInference traverses the PostgreSQL 17 AST to catch side-channel oracle probes
-// against masked PII columns in WHERE/HAVING predicates, ORDER BY/GROUP BY clauses,
-// and string-slicing/encoding functions (e.g. SUBSTRING(tckn, 1, 5) AS prefix).
+// against masked PII columns in WHERE/HAVING/FILTER/WINDOW/DISTINCT/ORDER BY/GROUP BY/EXPLAIN clauses,
+// projection operators (LIKE, >, ~, ||, IN, BETWEEN), risky casts (::bytea), and slicing/encoding functions.
 func detectPIIInference(tree *pg_query.ParseResult, protected map[string]bool) (col string, via string) {
 	var walkStmt func(n *pg_query.Node) (string, string)
 	var findColInExpr func(n *pg_query.Node) string
@@ -848,10 +1201,40 @@ func detectPIIInference(tree *pg_query.ParseResult, protected map[string]bool) (
 					return c
 				}
 			}
+			if c := findColInExpr(inner.FuncCall.AggFilter); c != "" {
+				return c
+			}
+			if inner.FuncCall.Over != nil {
+				for _, p := range inner.FuncCall.Over.PartitionClause {
+					if c := findColInExpr(p); c != "" {
+						return c
+					}
+				}
+				for _, o := range inner.FuncCall.Over.OrderClause {
+					if c := findColInExpr(o); c != "" {
+						return c
+					}
+				}
+			}
+		case *pg_query.Node_WindowDef:
+			for _, p := range inner.WindowDef.PartitionClause {
+				if c := findColInExpr(p); c != "" {
+					return c
+				}
+			}
+			for _, o := range inner.WindowDef.OrderClause {
+				if c := findColInExpr(o); c != "" {
+					return c
+				}
+			}
 		case *pg_query.Node_TypeCast:
 			return findColInExpr(inner.TypeCast.Arg)
 		case *pg_query.Node_NullTest:
 			return findColInExpr(inner.NullTest.Arg)
+		case *pg_query.Node_BooleanTest:
+			return findColInExpr(inner.BooleanTest.Arg)
+		case *pg_query.Node_NamedArgExpr:
+			return findColInExpr(inner.NamedArgExpr.Arg)
 		case *pg_query.Node_CaseExpr:
 			if c := findColInExpr(inner.CaseExpr.Arg); c != "" {
 				return c
@@ -873,11 +1256,42 @@ func detectPIIInference(tree *pg_query.ParseResult, protected map[string]bool) (
 					return c
 				}
 			}
+		case *pg_query.Node_MinMaxExpr:
+			for _, a := range inner.MinMaxExpr.Args {
+				if c := findColInExpr(a); c != "" {
+					return c
+				}
+			}
+		case *pg_query.Node_RowExpr:
+			for _, a := range inner.RowExpr.Args {
+				if c := findColInExpr(a); c != "" {
+					return c
+				}
+			}
+		case *pg_query.Node_AArrayExpr:
+			for _, el := range inner.AArrayExpr.Elements {
+				if c := findColInExpr(el); c != "" {
+					return c
+				}
+			}
+		case *pg_query.Node_AIndirection:
+			if c := findColInExpr(inner.AIndirection.Arg); c != "" {
+				return c
+			}
+			for _, ind := range inner.AIndirection.Indirection {
+				if c := findColInExpr(ind); c != "" {
+					return c
+				}
+			}
 		case *pg_query.Node_SubLink:
 			if c := findColInExpr(inner.SubLink.Testexpr); c != "" {
 				return c
 			}
 			return findColInExpr(inner.SubLink.Subselect)
+		case *pg_query.Node_SelectStmt:
+			if c, _ := walkStmt(n); c != "" {
+				return c
+			}
 		case *pg_query.Node_List:
 			for _, item := range inner.List.Items {
 				if c := findColInExpr(item); c != "" {
@@ -901,6 +1315,22 @@ func detectPIIInference(tree *pg_query.ParseResult, protected map[string]bool) (
 		case *pg_query.Node_ResTarget:
 			return checkTargetsForTransform(inner.ResTarget.Val)
 		case *pg_query.Node_FuncCall:
+			// Catch FILTER (WHERE tckn ...) and OVER (PARTITION/ORDER BY tckn)
+			if c := findColInExpr(inner.FuncCall.AggFilter); c != "" {
+				return c, "aggregate FILTER predicate"
+			}
+			if inner.FuncCall.Over != nil {
+				for _, p := range inner.FuncCall.Over.PartitionClause {
+					if c := findColInExpr(p); c != "" {
+						return c, "WINDOW PARTITION BY clause"
+					}
+				}
+				for _, o := range inner.FuncCall.Over.OrderClause {
+					if c := findColInExpr(o); c != "" {
+						return c, "WINDOW ORDER BY clause"
+					}
+				}
+			}
 			if len(inner.FuncCall.Funcname) > 0 {
 				last := inner.FuncCall.Funcname[len(inner.FuncCall.Funcname)-1]
 				if s := last.GetString_(); s != nil {
@@ -920,24 +1350,49 @@ func detectPIIInference(tree *pg_query.ParseResult, protected map[string]bool) (
 				}
 			}
 		case *pg_query.Node_AExpr:
-			// Catch string concatenation operator `||` or comparison in projection (e.g. SELECT tckn || '' AS x)
-			if inner.AExpr.Kind == pg_query.A_Expr_Kind_AEXPR_OP && len(inner.AExpr.Name) == 1 {
-				if op := inner.AExpr.Name[0].GetString_(); op != nil && (op.Sval == "||" || op.Sval == "=" || op.Sval == "~~" || op.Sval == "~~*") {
-					if c := findColInExpr(n); c != "" {
-						return c, fmt.Sprintf("projection operator %q", op.Sval)
+			// Catch ANY operator/comparison/LIKE/ILIKE/IN/BETWEEN/SIMILAR/concat on a protected column in projection
+			if c := findColInExpr(n); c != "" {
+				opLabel := inner.AExpr.Kind.String()
+				if len(inner.AExpr.Name) > 0 {
+					if s := inner.AExpr.Name[len(inner.AExpr.Name)-1].GetString_(); s != nil {
+						opLabel = s.Sval
 					}
 				}
+				return c, fmt.Sprintf("projection operator %q", opLabel)
 			}
-			if c, v := checkTargetsForTransform(inner.AExpr.Lexpr); c != "" {
-				return c, v
-			}
-			return checkTargetsForTransform(inner.AExpr.Rexpr)
 		case *pg_query.Node_CaseExpr:
 			if c := findColInExpr(n); c != "" {
 				return c, "CASE projection"
 			}
+		case *pg_query.Node_CoalesceExpr:
+			if c := findColInExpr(n); c != "" {
+				return c, "COALESCE projection"
+			}
+		case *pg_query.Node_MinMaxExpr:
+			if c := findColInExpr(n); c != "" {
+				return c, "GREATEST/LEAST projection"
+			}
 		case *pg_query.Node_TypeCast:
+			if isRiskyCast(inner.TypeCast) {
+				if c := findColInExpr(inner.TypeCast.Arg); c != "" {
+					return c, "binary/numeric type cast"
+				}
+			}
 			return checkTargetsForTransform(inner.TypeCast.Arg)
+		case *pg_query.Node_NamedArgExpr:
+			return checkTargetsForTransform(inner.NamedArgExpr.Arg)
+		case *pg_query.Node_RowExpr:
+			for _, a := range inner.RowExpr.Args {
+				if c, v := checkTargetsForTransform(a); c != "" {
+					return c, v
+				}
+			}
+		case *pg_query.Node_AArrayExpr:
+			for _, el := range inner.AArrayExpr.Elements {
+				if c, v := checkTargetsForTransform(el); c != "" {
+					return c, v
+				}
+			}
 		case *pg_query.Node_SubLink:
 			return walkStmt(inner.SubLink.Subselect)
 		}
@@ -960,11 +1415,21 @@ func detectPIIInference(tree *pg_query.ParseResult, protected map[string]bool) (
 					}
 				}
 			}
+			for _, dc := range s.DistinctClause {
+				if c := findColInExpr(dc); c != "" {
+					return c, "DISTINCT ON clause"
+				}
+			}
 			if c := findColInExpr(s.WhereClause); c != "" {
 				return c, "WHERE predicate"
 			}
 			if c := findColInExpr(s.HavingClause); c != "" {
 				return c, "HAVING predicate"
+			}
+			for _, w := range s.WindowClause {
+				if c := findColInExpr(w); c != "" {
+					return c, "WINDOW clause"
+				}
 			}
 			for _, sb := range s.SortClause {
 				if c := findColInExpr(sb); c != "" {
@@ -996,6 +1461,26 @@ func detectPIIInference(tree *pg_query.ParseResult, protected map[string]bool) (
 					return c, v
 				}
 			}
+		case *pg_query.Node_ExplainStmt:
+			return walkStmt(inner.ExplainStmt.Query)
+		case *pg_query.Node_PrepareStmt:
+			return walkStmt(inner.PrepareStmt.Query)
+		case *pg_query.Node_DeclareCursorStmt:
+			return walkStmt(inner.DeclareCursorStmt.Query)
+		case *pg_query.Node_UpdateStmt:
+			if c := findColInExpr(inner.UpdateStmt.WhereClause); c != "" {
+				return c, "UPDATE WHERE predicate"
+			}
+		case *pg_query.Node_DeleteStmt:
+			if c := findColInExpr(inner.DeleteStmt.WhereClause); c != "" {
+				return c, "DELETE WHERE predicate"
+			}
+		case *pg_query.Node_InsertStmt:
+			return walkStmt(inner.InsertStmt.SelectStmt)
+		case *pg_query.Node_MergeStmt:
+			if c := findColInExpr(inner.MergeStmt.JoinCondition); c != "" {
+				return c, "MERGE ON predicate"
+			}
 		case *pg_query.Node_RangeSubselect:
 			return walkStmt(inner.RangeSubselect.Subquery)
 		case *pg_query.Node_JoinExpr:
@@ -1018,4 +1503,94 @@ func detectPIIInference(tree *pg_query.ParseResult, protected map[string]bool) (
 		}
 	}
 	return "", ""
+}
+
+// extractTargetProvenance inspects the top-level SELECT / RETURNING target list so that
+// column aliases (e.g. `SELECT full_name AS fn FROM customers`) still inherit explicit column_rules.
+func extractTargetProvenance(tree *pg_query.ParseResult) ([][]string, map[string][]string) {
+	if tree == nil || len(tree.Stmts) == 0 || tree.Stmts[0] == nil || tree.Stmts[0].Stmt == nil {
+		return nil, nil
+	}
+	var targets []*pg_query.Node
+	switch s := tree.Stmts[0].Stmt.Node.(type) {
+	case *pg_query.Node_SelectStmt:
+		targets = s.SelectStmt.TargetList
+	case *pg_query.Node_InsertStmt:
+		targets = s.InsertStmt.ReturningList
+	case *pg_query.Node_UpdateStmt:
+		targets = s.UpdateStmt.ReturningList
+	case *pg_query.Node_DeleteStmt:
+		targets = s.DeleteStmt.ReturningList
+	default:
+		return nil, nil
+	}
+	if len(targets) == 0 {
+		return nil, nil
+	}
+
+	// If query uses SELECT *, positional mapping cannot predict expanded columns.
+	hasStar := false
+	positional := make([][]string, len(targets))
+	aliases := make(map[string][]string)
+
+	var collectCols func(n *pg_query.Node, out *[]string)
+	collectCols = func(n *pg_query.Node, out *[]string) {
+		if n == nil {
+			return
+		}
+		switch inner := n.Node.(type) {
+		case *pg_query.Node_ColumnRef:
+			for _, f := range inner.ColumnRef.Fields {
+				if f.GetAStar() != nil {
+					hasStar = true
+					return
+				}
+			}
+			if len(inner.ColumnRef.Fields) > 0 {
+				last := inner.ColumnRef.Fields[len(inner.ColumnRef.Fields)-1]
+				if s := last.GetString_(); s != nil {
+					*out = append(*out, strings.ToLower(s.Sval))
+				}
+			}
+		case *pg_query.Node_TypeCast:
+			collectCols(inner.TypeCast.Arg, out)
+		case *pg_query.Node_FuncCall:
+			for _, a := range inner.FuncCall.Args {
+				collectCols(a, out)
+			}
+		case *pg_query.Node_CoalesceExpr:
+			for _, a := range inner.CoalesceExpr.Args {
+				collectCols(a, out)
+			}
+		case *pg_query.Node_AExpr:
+			collectCols(inner.AExpr.Lexpr, out)
+			collectCols(inner.AExpr.Rexpr, out)
+		case *pg_query.Node_CaseExpr:
+			collectCols(inner.CaseExpr.Arg, out)
+			for _, w := range inner.CaseExpr.Args {
+				collectCols(w, out)
+			}
+			collectCols(inner.CaseExpr.Defresult, out)
+		case *pg_query.Node_CaseWhen:
+			collectCols(inner.CaseWhen.Expr, out)
+			collectCols(inner.CaseWhen.Result, out)
+		}
+	}
+
+	for i, t := range targets {
+		rt := t.GetResTarget()
+		if rt == nil {
+			continue
+		}
+		var cols []string
+		collectCols(rt.Val, &cols)
+		positional[i] = cols
+		if rt.Name != "" && len(cols) > 0 {
+			aliases[strings.ToLower(rt.Name)] = cols
+		}
+	}
+	if hasStar {
+		return nil, aliases
+	}
+	return positional, aliases
 }

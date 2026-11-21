@@ -57,10 +57,46 @@ func TestControlPlaneEndpoints(t *testing.T) {
 		t.Fatalf("PII leaked in inspect response: %q", inspectResp.MaskedSample)
 	}
 
-	// 3. /api/v1/policies
+	// 3. /api/v1/policies MUST redact upstream_password and masking_secret
 	rec = httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/policies", nil))
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"kvkk"`) {
 		t.Fatalf("/api/v1/policies unexpected: %d", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), "pgveil_dev_password") || strings.Contains(rec.Body.String(), "pgveil-change-me-in-production-hmac-key") {
+		t.Fatalf("/api/v1/policies leaked plaintext secrets in YAML response!")
+	}
+	if !strings.Contains(rec.Body.String(), policy.RedactedPlaceholder) {
+		t.Fatalf("expected %q placeholder in redacted policy YAML", policy.RedactedPlaceholder)
+	}
+
+	// 4. Reloading redacted YAML via PUT /api/v1/policies/yaml MUST preserve real secrets!
+	var polResp struct {
+		YAML string `json:"yaml"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &polResp)
+	reloadBody, _ := json.Marshal(map[string]string{"yaml": polResp.YAML})
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPut, "/api/v1/policies/yaml", bytes.NewReader(reloadBody)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PUT /api/v1/policies/yaml failed: %d %s", rec.Code, rec.Body.String())
+	}
+	if mgr.Config().Server.UpstreamPassword != "pgveil_dev_password" {
+		t.Fatalf("reloading redacted YAML clobbered upstream_password: got %q", mgr.Config().Server.UpstreamPassword)
+	}
+
+	// 5. Optional AdminToken Bearer auth enforcement
+	mgr.Config().Security.AdminToken = "super-secret-token"
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/summary", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 when AdminToken set and header missing, got %d", rec.Code)
+	}
+	authReq := httptest.NewRequest(http.MethodGet, "/api/v1/summary", nil)
+	authReq.Header.Set("Authorization", "Bearer super-secret-token")
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, authReq)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 with valid Bearer token, got %d", rec.Code)
 	}
 }

@@ -220,7 +220,19 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 		return s.toolQuery(ctx, prof, sqlStr)
 	case "explain_query":
 		sqlStr, _ := args["sql"].(string)
-		return s.toolQuery(ctx, prof, "EXPLAIN "+strings.TrimSpace(sqlStr))
+		trimmed := strings.TrimSpace(sqlStr)
+		if trimmed == "" {
+			return "sql parameter is required", true
+		}
+		upper := strings.ToUpper(trimmed)
+		// Block ANALYZE inside explain_query so this tool NEVER executes or mutates rows
+		if strings.Contains(upper, "ANALYZE") {
+			return "BLOCKED by pgveil: explain_query is plan-only and disallows EXPLAIN ANALYZE", true
+		}
+		if strings.HasPrefix(upper, "EXPLAIN ") || upper == "EXPLAIN" {
+			return s.toolQuery(ctx, prof, trimmed)
+		}
+		return s.toolQuery(ctx, prof, "EXPLAIN "+trimmed)
 	default:
 		return fmt.Sprintf("unknown tool %q", name), true
 	}
@@ -235,7 +247,13 @@ func (s *Server) toolListTables(ctx context.Context, prof *policy.RoleProfile) (
 
 	denied := make(map[string]bool)
 	for _, t := range prof.Firewall.DeniedTables {
-		denied[strings.ToLower(t)] = true
+		denied[strings.ToLower(strings.TrimSpace(t))] = true
+	}
+	allowed := make(map[string]bool)
+	for _, t := range prof.Firewall.AllowedTables {
+		if lt := strings.ToLower(strings.TrimSpace(t)); lt != "" {
+			allowed[lt] = true
+		}
 	}
 
 	rows, err := conn.Query(ctx, `
@@ -257,7 +275,9 @@ func (s *Server) toolListTables(ctx context.Context, prof *policy.RoleProfile) (
 		if err := rows.Scan(&sch, &tbl); err != nil {
 			continue
 		}
-		if denied[strings.ToLower(tbl)] || denied[strings.ToLower(sch+"."+tbl)] {
+		full := strings.ToLower(sch + "." + tbl)
+		bare := strings.ToLower(tbl)
+		if denied[bare] || denied[full] || (len(allowed) > 0 && !allowed[bare] && !allowed[full]) {
 			hiddenCount++
 			continue
 		}
@@ -272,14 +292,44 @@ func (s *Server) toolListTables(ctx context.Context, prof *policy.RoleProfile) (
 }
 
 func (s *Server) toolDescribeTable(ctx context.Context, prof *policy.RoleProfile, table string) (string, bool) {
-	tbl := strings.TrimSpace(table)
-	if tbl == "" {
+	raw := strings.TrimSpace(table)
+	if raw == "" {
 		return "table parameter is required", true
 	}
+	// Strip optional quotes and split optional schema.table so both "api_secrets" and "public.api_secrets" are enforced
+	cleaned := strings.ReplaceAll(raw, `"`, "")
+	schemaFilter := ""
+	bareTable := cleaned
+	if idx := strings.LastIndexByte(cleaned, '.'); idx >= 0 {
+		schemaFilter = strings.TrimSpace(cleaned[:idx])
+		bareTable = strings.TrimSpace(cleaned[idx+1:])
+	}
+	if bareTable == "" {
+		return "table parameter is invalid", true
+	}
+	lowFull := strings.ToLower(cleaned)
+	lowBare := strings.ToLower(bareTable)
 	for _, d := range prof.Firewall.DeniedTables {
-		if strings.EqualFold(d, tbl) {
-			return fmt.Sprintf("pgveil policy denied schema inspection of restricted table %q for profile %q", tbl, prof.Name), true
+		ld := strings.ToLower(strings.TrimSpace(d))
+		if ld == lowFull || ld == lowBare {
+			return fmt.Sprintf("pgveil policy denied schema inspection of restricted table %q for profile %q", raw, prof.Name), true
 		}
+	}
+	if len(prof.Firewall.AllowedTables) > 0 {
+		ok := false
+		for _, a := range prof.Firewall.AllowedTables {
+			la := strings.ToLower(strings.TrimSpace(a))
+			if la == lowFull || la == lowBare {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			return fmt.Sprintf("pgveil policy denied schema inspection: table %q is outside allowed_tables for profile %q", raw, prof.Name), true
+		}
+	}
+	if prof.Firewall.BlockSystemCatalogs && (strings.EqualFold(schemaFilter, "pg_catalog") || strings.HasPrefix(lowBare, "pg_")) {
+		return fmt.Sprintf("pgveil policy denied schema inspection of system catalog %q for profile %q", raw, prof.Name), true
 	}
 	conn, err := s.dialDB(ctx)
 	if err != nil {
@@ -290,9 +340,11 @@ func (s *Server) toolDescribeTable(ctx context.Context, prof *policy.RoleProfile
 	rows, err := conn.Query(ctx, `
 		SELECT column_name, data_type, is_nullable
 		FROM information_schema.columns
-		WHERE table_name = $1 AND table_schema NOT IN ('pg_catalog', 'information_schema')
+		WHERE lower(table_name) = lower($1)
+		  AND ($2 = '' OR lower(table_schema) = lower($2))
+		  AND table_schema NOT IN ('pg_catalog', 'information_schema')
 		ORDER BY ordinal_position
-	`, tbl)
+	`, bareTable, schemaFilter)
 	if err != nil {
 		return "describe error: " + err.Error(), true
 	}
@@ -315,7 +367,7 @@ func (s *Server) toolDescribeTable(ctx context.Context, prof *policy.RoleProfile
 		}
 	}
 	out, _ := json.MarshalIndent(map[string]any{
-		"table":   tbl,
+		"table":   raw,
 		"profile": prof.Name,
 		"columns": cols,
 	}, "", "  ")
@@ -364,10 +416,31 @@ func (s *Server) toolQuery(ctx context.Context, prof *policy.RoleProfile, sqlStr
 	fds := rows.FieldDescriptions()
 	cols := make([]string, len(fds))
 	strats := make([]pii.Strategy, len(fds))
+	hintCols := make([]string, len(fds))
 	for i, fd := range fds {
 		cols[i] = string(fd.Name)
+		hintCols[i] = cols[i]
 		if prof.Masking.Enabled {
-			strats[i] = prof.ColumnStrategy(cols[i])
+			st := prof.ColumnStrategy(cols[i])
+			if st == "" && i < len(dec.TargetSources) {
+				for _, src := range dec.TargetSources[i] {
+					if srcStrat := prof.ColumnStrategy(src); srcStrat != "" {
+						st = srcStrat
+						hintCols[i] = src
+						break
+					}
+				}
+			}
+			if st == "" && len(dec.AliasSources) > 0 {
+				for _, src := range dec.AliasSources[strings.ToLower(cols[i])] {
+					if srcStrat := prof.ColumnStrategy(src); srcStrat != "" {
+						st = srcStrat
+						hintCols[i] = src
+						break
+					}
+				}
+			}
+			strats[i] = st
 		}
 	}
 
@@ -392,7 +465,7 @@ func (s *Server) toolQuery(ctx context.Context, prof *policy.RoleProfile, sqlStr
 			}
 			val := string(rawVals[i])
 			if prof.Masking.Enabled {
-				mv, setNull, found := masker.MaskColumn(col, val, strats[i], prof.Masking.AutoDetectPII, enabled)
+				mv, setNull, found := masker.MaskColumn(hintCols[i], val, strats[i], prof.Masking.AutoDetectPII, enabled)
 				if setNull {
 					rec[col] = nil
 					maskedCells++
@@ -407,13 +480,16 @@ func (s *Server) toolQuery(ctx context.Context, prof *policy.RoleProfile, sqlStr
 		}
 		result = append(result, rec)
 	}
+	if err := rows.Err(); err != nil {
+		return "PostgreSQL error: " + err.Error(), true
+	}
 
 	payload, _ := json.MarshalIndent(map[string]any{
-		"profile":           prof.Name,
-		"row_count":         len(result),
-		"truncated":         truncated,
-		"pii_cells_masked":  maskedCells,
-		"rows":              result,
+		"profile":          prof.Name,
+		"row_count":        len(result),
+		"truncated":        truncated,
+		"pii_cells_masked": maskedCells,
+		"rows":             result,
 	}, "", "  ")
 	return string(payload), false
 }
@@ -422,11 +498,13 @@ func (s *Server) dialDB(ctx context.Context) (*pgx.Conn, error) {
 	dsn := s.dsn
 	if dsn == "" {
 		cfg := s.policyMgr.Config()
-		dsn = fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=disable&application_name=pgveil-mcp",
+		dsn = policy.BuildDSN(
+			cfg.Server.UpstreamAddr,
 			cfg.Server.UpstreamUser,
 			cfg.Server.UpstreamPassword,
-			cfg.Server.UpstreamAddr,
 			cfg.Server.UpstreamDatabase,
+			"pgveil-mcp",
+			cfg.Server.UpstreamTLS.Enabled,
 		)
 	}
 	connCfg, err := pgx.ParseConfig(dsn)

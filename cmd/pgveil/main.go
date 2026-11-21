@@ -28,7 +28,7 @@ import (
 )
 
 var (
-	version = "0.3.0"
+	version = "0.3.1"
 	commit  = "dev"
 )
 
@@ -186,12 +186,14 @@ func runDiscover(args []string) {
 		}
 		cfg := mgr.Config()
 		secret = cfg.Security.MaskingSecret
-		sslMode := "disable"
-		if cfg.Server.UpstreamTLS.Enabled {
-			sslMode = "require"
-		}
-		targetDSN = fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=%s",
-			cfg.Server.UpstreamUser, cfg.Server.UpstreamPassword, cfg.Server.UpstreamAddr, cfg.Server.UpstreamDatabase, sslMode)
+		targetDSN = policy.BuildDSN(
+			cfg.Server.UpstreamAddr,
+			cfg.Server.UpstreamUser,
+			cfg.Server.UpstreamPassword,
+			cfg.Server.UpstreamDatabase,
+			"pgveil-discover",
+			cfg.Server.UpstreamTLS.Enabled,
+		)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)

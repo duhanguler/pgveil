@@ -180,6 +180,126 @@ func TestASTFirewallEnforcements(t *testing.T) {
 			wantAction: ActionBlock,
 			wantRule:   "pii_side_channel_inference",
 		},
+		{
+			name:       "PII side-channel SELECT LIKE projection probe blocked",
+			sql:        "SELECT id, tckn LIKE '100000%' AS hit FROM customers",
+			wantAction: ActionBlock,
+			wantRule:   "pii_side_channel_inference",
+		},
+		{
+			name:       "PII side-channel SELECT greater-than oracle blocked",
+			sql:        "SELECT id, tckn > '10000000000' AS hi FROM customers",
+			wantAction: ActionBlock,
+			wantRule:   "pii_side_channel_inference",
+		},
+		{
+			name:       "PII side-channel aggregate FILTER bypass blocked",
+			sql:        "SELECT COUNT(*) FILTER (WHERE tckn LIKE '100000%') FROM customers",
+			wantAction: ActionBlock,
+			wantRule:   "pii_side_channel_inference",
+		},
+		{
+			name:       "PII side-channel WINDOW ORDER BY bypass blocked",
+			sql:        "SELECT id, ROW_NUMBER() OVER (ORDER BY tckn) FROM customers",
+			wantAction: ActionBlock,
+			wantRule:   "pii_side_channel_inference",
+		},
+		{
+			name:       "PII side-channel DISTINCT ON bypass blocked",
+			sql:        "SELECT DISTINCT ON (tckn) id FROM customers",
+			wantAction: ActionBlock,
+			wantRule:   "pii_side_channel_inference",
+		},
+		{
+			name:       "PII side-channel bytea cast hex exfiltration blocked",
+			sql:        "SELECT id, tckn::bytea FROM customers",
+			wantAction: ActionBlock,
+			wantRule:   "pii_side_channel_inference",
+		},
+		{
+			name:       "PII side-channel EXPLAIN row-estimate oracle blocked",
+			sql:        "EXPLAIN SELECT id FROM customers WHERE tckn = '10000000146'",
+			wantAction: ActionBlock,
+			wantRule:   "pii_side_channel_inference",
+		},
+		{
+			name:       "VALUES dangerous function bypass blocked",
+			sql:        "VALUES (pg_read_file('/etc/passwd'))",
+			wantAction: ActionBlock,
+			wantRule:   "block_dangerous_functions",
+		},
+		{
+			name:       "table_to_xml denied table bypass blocked",
+			sql:        "SELECT table_to_xml('api_secrets', true, false, '')",
+			wantAction: ActionBlock,
+			wantRule:   "block_dangerous_functions",
+		},
+		{
+			name:       "set_config role escalation bypass blocked",
+			sql:        "SELECT set_config('role', 'postgres', false)",
+			wantAction: ActionBlock,
+			wantRule:   "block_dangerous_functions",
+		},
+		{
+			name:       "pg_stats planner PII statistics leak blocked",
+			sql:        "SELECT most_common_vals FROM pg_stats WHERE tablename = 'customers'",
+			wantAction: ActionBlock,
+			wantRule:   "block_system_catalogs",
+		},
+		{
+			name:       "pg_stat_activity live SQL leak blocked",
+			sql:        "SELECT query FROM pg_stat_activity",
+			wantAction: ActionBlock,
+			wantRule:   "block_system_catalogs",
+		},
+		{
+			name:       "SELECT INTO table creation blocked as DDL",
+			sql:        "SELECT id INTO evil_copy FROM customers",
+			wantAction: ActionBlock,
+			wantRule:   "block_ddl",
+		},
+		{
+			name:       "SET row_security off blocked as privilege escalation",
+			sql:        "SET row_security = off",
+			wantAction: ActionBlock,
+			wantRule:   "block_role_escalation",
+		},
+		{
+			name:       "DELETE tautology 2 > 1 blocked",
+			sql:        "DELETE FROM orders WHERE 2 > 1",
+			wantAction: ActionBlock,
+			wantRule:   "block_write_without_where",
+		},
+		{
+			name:       "DELETE tautology self-equality id = id blocked",
+			sql:        "DELETE FROM orders WHERE id = id",
+			wantAction: ActionBlock,
+			wantRule:   "block_write_without_where",
+		},
+		{
+			name:       "DELETE tautology NOT (1 = 2) blocked",
+			sql:        "DELETE FROM orders WHERE NOT (1 = 2)",
+			wantAction: ActionBlock,
+			wantRule:   "block_write_without_where",
+		},
+		{
+			name:       "DELETE tautology 1 IN (1, 2) blocked",
+			sql:        "DELETE FROM orders WHERE 1 IN (1, 2)",
+			wantAction: ActionBlock,
+			wantRule:   "block_write_without_where",
+		},
+		{
+			name:       "PREPARE unscoped DELETE bypass blocked",
+			sql:        "PREPARE p AS DELETE FROM orders WHERE 1 = 1",
+			wantAction: ActionBlock,
+			wantRule:   "block_write_without_where",
+		},
+		{
+			name:       "PREPARE denied table bypass blocked",
+			sql:        "PREPARE p AS SELECT * FROM api_secrets",
+			wantAction: ActionBlock,
+			wantRule:   "denied_table",
+		},
 	}
 
 	for _, tc := range cases {
@@ -193,6 +313,23 @@ func TestASTFirewallEnforcements(t *testing.T) {
 				t.Errorf("got rule=%q want %q", dec.Rule, tc.wantRule)
 			}
 		})
+	}
+}
+
+func TestTargetColumnProvenanceForAliases(t *testing.T) {
+	prof := testAIAgentProfile()
+	dec := Evaluate("SELECT id, full_name AS display_name, email AS contact FROM customers LIMIT 5", prof)
+	if dec.Action != ActionAllow {
+		t.Fatalf("expected ALLOW, got %+v", dec)
+	}
+	if len(dec.TargetSources) != 3 {
+		t.Fatalf("expected 3 target sources, got %+v", dec.TargetSources)
+	}
+	if len(dec.AliasSources["display_name"]) == 0 || dec.AliasSources["display_name"][0] != "full_name" {
+		t.Fatalf("expected display_name alias to map to full_name, got %+v", dec.AliasSources)
+	}
+	if len(dec.AliasSources["contact"]) == 0 || dec.AliasSources["contact"][0] != "email" {
+		t.Fatalf("expected contact alias to map to email, got %+v", dec.AliasSources)
 	}
 }
 

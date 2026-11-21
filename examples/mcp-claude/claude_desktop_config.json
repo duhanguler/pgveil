@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "postgres-zero-trust": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "@modelcontextprotocol/server-postgres",
+        "postgres://pgveil:pgveil_dev_password@127.0.0.1:6432/pgveil_demo?sslmode=disable&application_name=claude-mcp"
+      ]
+    }
+  }
+}

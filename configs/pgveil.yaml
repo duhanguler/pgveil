@@ -1,0 +1,219 @@
+# pgveil — Zero-Trust PostgreSQL Wire-Protocol Proxy Configuration
+# Hot-reloadable via SIGHUP or the Control Plane REST API / Web Console.
+
+server:
+  listen_addr: ":6432"
+  admin_addr: ":8088"
+  upstream_addr: "127.0.0.1:5432"
+  upstream_user: "pgveil"
+  upstream_password: "pgveil_dev_password"
+  upstream_database: "pgveil_demo"
+  tls:
+    enabled: false
+    cert_file: ""
+    key_file: ""
+
+security:
+  # HMAC secret for deterministic JOIN-preserving pseudonymization (`hash` / `fake` strategies).
+  # Override in production with PGVEIL_MASKING_SECRET env var.
+  masking_secret: "pgveil-change-me-in-production-hmac-key"
+  hitl_default_timeout: "60s"
+  # Enable compliance packs globally (can also be overridden per role)
+  compliance_packs:
+    - gdpr
+    - kvkk
+    - pci-dss
+    - hipaa
+    - secrets
+
+telemetry:
+  service_name: "pgveil-proxy"
+  prometheus_enabled: true
+  otel_enabled: false
+  otel_endpoint: "localhost:4317"
+
+kafka:
+  enabled: false
+  brokers:
+    - "localhost:9092"
+  audit_topic: "pgveil.audit.queries"
+  alerts_topic: "pgveil.alerts.security"
+  dlq_topic: "pgveil.audit.dlq"
+  client_id: "pgveil-proxy"
+
+# Role profiles matched against PostgreSQL StartupMessage `application_name` or `user`.
+# First matching profile wins; `default_profile` applies when no rule matches.
+default_profile: "analyst"
+
+profiles:
+  - name: "ai_agent"
+    description: "Zero-trust sandbox for AI SQL agents, Claude Code, Cursor, and MCP Postgres servers."
+    match:
+      application_names:
+        - "ai_agent"
+        - "claude-mcp*"
+        - "cursor*"
+        - "langchain*"
+        - "mcp-postgres*"
+      users:
+        - "ai_agent"
+        - "mcp_readonly"
+    firewall:
+      allow_statements: ["SELECT", "EXPLAIN", "SHOW"]
+      block_ddl: true
+      block_multi_statement: true
+      block_write_without_where: true
+      block_dangerous_functions: true
+      block_system_catalogs: true
+      require_hitl_statements: ["UPDATE", "DELETE", "INSERT"]
+      hitl_mode: "hold" # "hold" pauses query live until human approves/denies; "reject" fails immediately with approval ID
+      hitl_timeout: "60s"
+      denied_tables:
+        - "api_secrets"
+        - "pg_shadow"
+        - "pg_authid"
+        - "pg_roles"
+      max_rows: 25
+      max_rows_action: "truncate" # "truncate" caps DataRows + emits Notice; "block" aborts with SQLSTATE 42501
+      block_select_star_on_pii_tables: false
+    masking:
+      enabled: true
+      auto_detect_pii: true
+      compliance_packs: ["gdpr", "kvkk", "pci-dss", "hipaa", "secrets"]
+      column_rules:
+        - column: "email"
+          strategy: "partial"
+        - column: "full_name"
+          strategy: "hash"
+        - column: "phone"
+          strategy: "partial"
+        - column: "tckn"
+          strategy: "partial"
+        - column: "national_id"
+          strategy: "partial"
+        - column: "ssn"
+          strategy: "redact"
+        - column: "iban"
+          strategy: "partial"
+        - column: "card_number"
+          strategy: "last4"
+        - column: "credit_card"
+          strategy: "last4"
+        - column: "secret_value"
+          strategy: "redact"
+        - column: "api_key"
+          strategy: "redact"
+        - column: "password_hash"
+          strategy: "redact"
+
+  - name: "analyst"
+    description: "Read-only BI & analytics profile with JOIN-preserving pseudonymization and row budgets."
+    match:
+      application_names:
+        - "analyst*"
+        - "metabase*"
+        - "superset*"
+        - "dbeaver*"
+      users:
+        - "analyst"
+        - "bi_reader"
+    firewall:
+      allow_statements: ["SELECT", "EXPLAIN", "SHOW"]
+      block_ddl: true
+      block_multi_statement: true
+      block_write_without_where: true
+      block_dangerous_functions: true
+      block_system_catalogs: true
+      require_hitl_statements: []
+      hitl_mode: "reject"
+      hitl_timeout: "45s"
+      denied_tables:
+        - "api_secrets"
+        - "pg_shadow"
+        - "pg_authid"
+      max_rows: 500
+      max_rows_action: "truncate"
+    masking:
+      enabled: true
+      auto_detect_pii: true
+      compliance_packs: ["gdpr", "kvkk", "pci-dss", "hipaa", "secrets"]
+      column_rules:
+        - column: "email"
+          strategy: "hash"
+        - column: "phone"
+          strategy: "partial"
+        - column: "tckn"
+          strategy: "hash"
+        - column: "ssn"
+          strategy: "redact"
+        - column: "iban"
+          strategy: "partial"
+        - column: "card_number"
+          strategy: "last4"
+        - column: "secret_value"
+          strategy: "redact"
+
+  - name: "developer"
+    description: "Staging/production debugging profile: masked PII, safe scoped writes with HITL approval."
+    match:
+      application_names:
+        - "developer*"
+        - "dev_*"
+        - "datagrip*"
+      users:
+        - "developer"
+    firewall:
+      allow_statements: ["SELECT", "EXPLAIN", "SHOW", "INSERT", "UPDATE"]
+      block_ddl: true
+      block_multi_statement: true
+      block_write_without_where: true
+      block_dangerous_functions: true
+      block_system_catalogs: false
+      require_hitl_statements: ["DELETE", "UPDATE"]
+      hitl_mode: "hold"
+      hitl_timeout: "60s"
+      denied_tables:
+        - "api_secrets"
+      max_rows: 2000
+      max_rows_action: "truncate"
+    masking:
+      enabled: true
+      auto_detect_pii: true
+      compliance_packs: ["pci-dss", "kvkk", "secrets"]
+      column_rules:
+        - column: "tckn"
+          strategy: "partial"
+        - column: "iban"
+          strategy: "partial"
+        - column: "card_number"
+          strategy: "last4"
+        - column: "secret_value"
+          strategy: "redact"
+
+  - name: "admin"
+    description: "Break-glass DBA profile: full unmasked access, audited asynchronously with DDL/multi-statement logging."
+    match:
+      application_names:
+        - "admin*"
+        - "pgveil-admin*"
+      users:
+        - "admin"
+        - "dba"
+    firewall:
+      allow_statements: ["*"]
+      block_ddl: false
+      block_multi_statement: false
+      block_write_without_where: false
+      block_dangerous_functions: false
+      block_system_catalogs: false
+      require_hitl_statements: []
+      hitl_mode: "reject"
+      hitl_timeout: "30s"
+      denied_tables: []
+      max_rows: 0
+      max_rows_action: "truncate"
+    masking:
+      enabled: false
+      auto_detect_pii: false
+      compliance_packs: []
+      column_rules: []

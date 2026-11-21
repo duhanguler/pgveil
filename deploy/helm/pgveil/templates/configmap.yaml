@@ -1,0 +1,84 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "pgveil.fullname" . }}-config
+  labels:
+    {{- include "pgveil.labels" . | nindent 4 }}
+data:
+  pgveil.yaml: |
+    server:
+      listen_addr: ":{{ .Values.service.wirePort }}"
+      admin_addr: ":{{ .Values.service.adminPort }}"
+      upstream_addr: "{{ .Values.upstream.addr }}"
+      upstream_user: "{{ .Values.upstream.user }}"
+      upstream_database: "{{ .Values.upstream.database }}"
+    security:
+      hitl_default_timeout: "60s"
+      compliance_packs:
+        {{- toYaml .Values.security.compliancePacks | nindent 8 }}
+    telemetry:
+      service_name: "pgveil-proxy"
+      prometheus_enabled: true
+      otel_enabled: {{ .Values.telemetry.otelEnabled }}
+      otel_endpoint: "{{ .Values.telemetry.otelEndpoint }}"
+    kafka:
+      enabled: {{ .Values.kafka.enabled }}
+      brokers:
+        {{- toYaml .Values.kafka.brokers | nindent 8 }}
+      audit_topic: "{{ .Values.kafka.auditTopic }}"
+      alerts_topic: "{{ .Values.kafka.alertsTopic }}"
+      dlq_topic: "{{ .Values.kafka.dlqTopic }}"
+    default_profile: "analyst"
+    profiles:
+      - name: "ai_agent"
+        description: "Zero-trust sandbox for AI SQL agents and MCP Postgres servers."
+        match:
+          application_names: ["ai_agent", "claude-mcp*", "cursor*", "langchain*", "mcp-postgres*"]
+          users: ["ai_agent", "mcp_readonly"]
+        firewall:
+          allow_statements: ["SELECT", "EXPLAIN", "SHOW"]
+          block_ddl: true
+          block_multi_statement: true
+          block_write_without_where: true
+          block_dangerous_functions: true
+          block_system_catalogs: true
+          require_hitl_statements: ["UPDATE", "DELETE", "INSERT"]
+          hitl_mode: "hold"
+          hitl_timeout: "60s"
+          denied_tables: ["api_secrets", "pg_shadow", "pg_authid"]
+          max_rows: 25
+          max_rows_action: "truncate"
+        masking:
+          enabled: true
+          auto_detect_pii: true
+          compliance_packs: ["gdpr", "kvkk", "pci-dss", "hipaa", "secrets"]
+          column_rules:
+            - { column: "email", strategy: "partial" }
+            - { column: "tckn", strategy: "partial" }
+            - { column: "iban", strategy: "partial" }
+            - { column: "card_number", strategy: "last4" }
+            - { column: "secret_value", strategy: "redact" }
+      - name: "analyst"
+        description: "Read-only BI analytics profile with deterministic pseudonymization."
+        match:
+          application_names: ["analyst*", "metabase*", "superset*"]
+          users: ["analyst"]
+        firewall:
+          allow_statements: ["SELECT", "EXPLAIN", "SHOW"]
+          block_ddl: true
+          block_multi_statement: true
+          block_write_without_where: true
+          block_dangerous_functions: true
+          block_system_catalogs: true
+          denied_tables: ["api_secrets", "pg_shadow", "pg_authid"]
+          max_rows: 500
+          max_rows_action: "truncate"
+        masking:
+          enabled: true
+          auto_detect_pii: true
+          compliance_packs: ["gdpr", "kvkk", "pci-dss", "hipaa", "secrets"]
+          column_rules:
+            - { column: "email", strategy: "hash" }
+            - { column: "tckn", strategy: "hash" }
+            - { column: "iban", strategy: "partial" }
+            - { column: "card_number", strategy: "last4" }

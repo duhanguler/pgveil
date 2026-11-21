@@ -1,0 +1,118 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: pgveil-postgres
+    environment:
+      POSTGRES_USER: pgveil
+      POSTGRES_PASSWORD: pgveil_dev_password
+      POSTGRES_DB: pgveil_demo
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./deploy/docker/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pgveil -d pgveil_demo"]
+      interval: 3s
+      timeout: 3s
+      retries: 15
+
+  redpanda:
+    image: redpandadata/redpanda:v24.2.8
+    container_name: pgveil-redpanda
+    command:
+      - redpanda
+      - start
+      - --smp=1
+      - --memory=512M
+      - --overprovisioned
+      - --node-id=0
+      - --check=false
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+    ports:
+      - "19092:19092"
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+
+  pgveil:
+    build:
+      context: .
+      target: pgveil
+    container_name: pgveil-proxy
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+    environment:
+      PGVEIL_LISTEN_ADDR: ":6432"
+      PGVEIL_ADMIN_ADDR: ":8088"
+      PGVEIL_UPSTREAM_ADDR: "postgres:5432"
+      PGVEIL_UPSTREAM_USER: "pgveil"
+      PGVEIL_UPSTREAM_PASSWORD: "pgveil_dev_password"
+      PGVEIL_UPSTREAM_DATABASE: "pgveil_demo"
+      PGVEIL_KAFKA_ENABLED: "true"
+      PGVEIL_KAFKA_BROKERS: "redpanda:9092"
+      PGVEIL_OTEL_ENABLED: "true"
+      PGVEIL_OTEL_ENDPOINT: "jaeger:4317"
+    ports:
+      - "6432:6432"
+      - "8088:8088"
+    volumes:
+      - ./configs/pgveil.yaml:/app/configs/pgveil.yaml:ro
+    restart: unless-stopped
+
+  audit-worker:
+    build:
+      context: .
+      target: audit-worker
+    container_name: pgveil-audit-worker
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redpanda:
+        condition: service_healthy
+    environment:
+      PGVEIL_KAFKA_BROKERS: "redpanda:9092"
+      PGVEIL_DATABASE_URL: "postgres://pgveil:pgveil_dev_password@postgres:5432/pgveil_demo?sslmode=disable"
+      PGVEIL_WORKER_ADDR: ":8089"
+    ports:
+      - "8089:8089"
+    restart: unless-stopped
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.62
+    container_name: pgveil-jaeger
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    container_name: pgveil-prometheus
+    volumes:
+      - ./deploy/docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports:
+      - "9090:9090"
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    container_name: pgveil-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: pgveil_grafana
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/pgveil-overview.json
+    volumes:
+      - ./deploy/docker/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./deploy/docker/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./deploy/docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus

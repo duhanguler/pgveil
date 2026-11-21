@@ -1,0 +1,80 @@
+replicaCount: 2
+
+image:
+  repository: ghcr.io/duhanguler/pgveil
+  tag: "0.1.0"
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  wirePort: 6432
+  adminPort: 8088
+
+upstream:
+  addr: "postgres-primary.database.svc.cluster.local:5432"
+  user: "pgveil"
+  database: "app"
+  existingSecret: ""
+
+security:
+  maskingSecret: "change-me-via-secret-manager"
+  compliancePacks:
+    - gdpr
+    - kvkk
+    - pci-dss
+    - hipaa
+    - secrets
+
+kafka:
+  enabled: true
+  brokers:
+    - "redpanda.messaging.svc.cluster.local:9092"
+  auditTopic: "pgveil.audit.queries"
+  alertsTopic: "pgveil.alerts.security"
+  dlqTopic: "pgveil.audit.dlq"
+
+telemetry:
+  otelEnabled: true
+  otelEndpoint: "otel-collector.observability.svc.cluster.local:4317"
+
+auditWorker:
+  enabled: true
+  replicaCount: 1
+  image:
+    repository: ghcr.io/duhanguler/pgveil-audit-worker
+    tag: "0.1.0"
+    pullPolicy: IfNotPresent
+  metricsPort: 8089
+  databaseURL: "postgres://pgveil:password@postgres-primary.database.svc.cluster.local:5432/app?sslmode=require"
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 500m
+      memory: 256Mi
+
+resources:
+  requests:
+    cpu: 150m
+    memory: 128Mi
+  limits:
+    cpu: 1000m
+    memory: 512Mi
+
+autoscaling:
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+networkPolicy:
+  enabled: true
+  allowedNamespaces:
+    - "ai-agents"
+    - "backend"
+    - "analytics"

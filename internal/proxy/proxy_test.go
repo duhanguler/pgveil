@@ -1,0 +1,250 @@
+package proxy
+
+import (
+	"bufio"
+	"context"
+	"encoding/binary"
+	"io"
+	"net"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/duhanguler/pgveil/internal/events"
+	"github.com/duhanguler/pgveil/internal/hitl"
+	"github.com/duhanguler/pgveil/internal/pgwire"
+	"github.com/duhanguler/pgveil/internal/policy"
+	"github.com/duhanguler/pgveil/internal/telemetry"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/prometheus/client_golang/prometheus"
+)
+
+// startFakePostgres runs a minimal PostgreSQL Wire Protocol v3 server in-memory for race-tested CI integration tests.
+func startFakePostgres(t *testing.T) (string, func()) {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go serveFakePGConn(c)
+		}
+	}()
+	return ln.Addr().String(), func() { _ = ln.Close() }
+}
+
+func serveFakePGConn(c net.Conn) {
+	defer c.Close()
+	for {
+		pkt, err := pgwire.ReadStartupPacket(c)
+		if err != nil {
+			return
+		}
+		if pkt.Code == pgwire.SSLRequestCode || pkt.Code == pgwire.GSSENCRequestCode {
+			_, _ = c.Write([]byte{'N'})
+			continue
+		}
+		break
+	}
+	// AuthOK (0) + ReadyForQuery ('I')
+	var authOK [4]byte
+	_ = pgwire.WriteMessage(c, pgwire.MsgAuth, authOK[:])
+	_ = pgwire.WriteMessage(c, pgwire.MsgParameterStatus, []byte("server_version\x0016.4\x00"))
+	_ = pgwire.WriteMessage(c, pgwire.MsgParameterStatus, []byte("client_encoding\x00UTF8\x00"))
+	_ = pgwire.WriteMessage(c, pgwire.MsgParameterStatus, []byte("standard_conforming_strings\x00on\x00"))
+	_ = pgwire.WriteMessage(c, pgwire.MsgReadyForQuery, pgwire.BuildReadyForQuery('I'))
+
+	r := bufio.NewReader(c)
+	var lastParsed string
+	for {
+		mType, payload, err := pgwire.ReadMessage(r)
+		if err != nil {
+			return
+		}
+		switch mType {
+		case pgwire.MsgTerminate:
+			return
+		case pgwire.MsgQuery:
+			sql := strings.ToUpper(strings.TrimSpace(pgwire.ParseSimpleQuery(payload)))
+			sendFakeResult(c, sql)
+			_ = pgwire.WriteMessage(c, pgwire.MsgReadyForQuery, pgwire.BuildReadyForQuery('I'))
+		case pgwire.MsgParse:
+			_, q, _ := pgwire.ParseParseMessage(payload)
+			lastParsed = strings.ToUpper(strings.TrimSpace(q))
+		case pgwire.MsgSync:
+			_ = pgwire.WriteMessage(c, pgwire.MsgParseComplete, nil)
+			_ = pgwire.WriteMessage(c, pgwire.MsgBindComplete, nil)
+			sendFakeResult(c, lastParsed)
+			_ = pgwire.WriteMessage(c, pgwire.MsgReadyForQuery, pgwire.BuildReadyForQuery('I'))
+		}
+	}
+}
+
+func sendFakeResult(w io.Writer, sql string) {
+	if strings.HasPrefix(sql, "UPDATE") {
+		_ = pgwire.WriteMessage(w, pgwire.MsgCommandComplete, pgwire.BuildCommandComplete("UPDATE 1"))
+		return
+	}
+	// Return 40 synthetic PII rows for customers query
+	rowDesc := encodeRowDesc([]string{"id", "email", "tckn", "iban", "note"})
+	_ = pgwire.WriteMessage(w, pgwire.MsgRowDescription, rowDesc)
+	count := 3
+	if strings.Contains(sql, "ALL_ROWS") {
+		count = 40
+	}
+	for i := 1; i <= count; i++ {
+		dr := pgwire.EncodeDataRow([][]byte{
+			[]byte("1"),
+			[]byte("ayse.kaya@example.com.tr"),
+			[]byte("10000000146"),
+			[]byte("TR330006100519786457841326"),
+			[]byte("Call me or refund card 4242-4242-4242-4242 and key AKIAIOSFODNN7EXAMPLE"),
+		})
+		_ = pgwire.WriteMessage(w, pgwire.MsgDataRow, dr)
+	}
+	_ = pgwire.WriteMessage(w, pgwire.MsgCommandComplete, pgwire.BuildCommandComplete("SELECT 40"))
+}
+
+func encodeRowDesc(cols []string) []byte {
+	var buf []byte
+	var cnt [2]byte
+	binary.BigEndian.PutUint16(cnt[:], uint16(len(cols)))
+	buf = append(buf, cnt[:]...)
+	for i, name := range cols {
+		buf = append(buf, []byte(name)...)
+		buf = append(buf, 0)
+		var meta [18]byte
+		binary.BigEndian.PutUint32(meta[0:4], 16384)
+		binary.BigEndian.PutUint16(meta[4:6], uint16(i+1))
+		binary.BigEndian.PutUint32(meta[6:10], 25) // text OID
+		binary.BigEndian.PutUint16(meta[10:12], 0xFFFF)
+		binary.BigEndian.PutUint32(meta[12:16], 0xFFFFFFFF)
+		binary.BigEndian.PutUint16(meta[16:18], 0) // text format
+		buf = append(buf, meta[:]...)
+	}
+	return buf
+}
+
+func TestEndToEndWireMaskingFirewallAndLiveHITL(t *testing.T) {
+	pgAddr, stopPG := startFakePostgres(t)
+	defer stopPG()
+
+	mgr, err := policy.LoadFile("../../configs/pgveil.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := mgr.Config()
+	cfg.Server.ListenAddr = "127.0.0.1:0"
+	cfg.Server.UpstreamAddr = pgAddr
+
+	reg := prometheus.NewRegistry()
+	metrics := telemetry.NewMetrics(reg)
+	hitlMgr := hitl.NewManager(50)
+	bus := events.NewBus(100, policy.KafkaConfig{}, metrics)
+	defer bus.Close()
+
+	srv, err := NewServer(mgr, hitlMgr, bus, metrics, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() { _ = srv.Start(ctx) }()
+	// Wait for ephemeral listener to bind
+	var proxyAddr string
+	for i := 0; i < 50; i++ {
+		if a := srv.Addr(); a != "" {
+			proxyAddr = a
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if proxyAddr == "" {
+		t.Fatal("proxy did not bind")
+	}
+
+	// Connect via real jackc/pgx/v5 driver as ai_agent!
+	dsn := "postgres://pgveil:pw@" + proxyAddr + "/pgveil_demo?sslmode=disable&application_name=claude-mcp-agent"
+	connCfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	connCfg.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	var notices []string
+	connCfg.OnNotice = func(_ *pgconn.PgConn, n *pgconn.Notice) {
+		notices = append(notices, n.Message)
+	}
+
+	conn, err := pgx.ConnectConfig(ctx, connCfg)
+	if err != nil {
+		t.Fatalf("pgx connect through pgveil failed: %v", err)
+	}
+	defer conn.Close(ctx)
+
+	// 1. Dynamic wire-speed PII masking + auto-detection on unstructured note column
+	var id, email, tckn, iban, note string
+	err = conn.QueryRow(ctx, "SELECT id, email, tckn, iban, note FROM customers LIMIT 1").Scan(&id, &email, &tckn, &iban, &note)
+	if err != nil {
+		t.Fatalf("SELECT failed: %v", err)
+	}
+	if strings.Contains(email, "ayse.kaya") || strings.Contains(tckn, "10000000146") || strings.Contains(iban, "1978645784") {
+		t.Fatalf("PII leaked over wire: email=%q tckn=%q iban=%q", email, tckn, iban)
+	}
+	if strings.Contains(note, "4242-4242-4242-4242") || strings.Contains(note, "AKIAIOSFODNN7EXAMPLE") {
+		t.Fatalf("free-text PII/secret leaked in note: %q", note)
+	}
+
+	// 2. AST Firewall blocks DROP TABLE cleanly and keeps connection alive!
+	if _, err := conn.Exec(ctx, "DROP TABLE orders"); err == nil {
+		t.Fatal("expected DROP TABLE to be blocked by AST firewall")
+	}
+
+	// 3. Row-exfiltration cap (ai_agent max_rows = 25) truncates 40 rows to 25 + emits PostgreSQL NOTICE
+	rows, err := conn.Query(ctx, "SELECT id, email, tckn, iban, note FROM customers /* ALL_ROWS */")
+	if err != nil {
+		t.Fatalf("bulk SELECT failed: %v", err)
+	}
+	gotRows := 0
+	for rows.Next() {
+		gotRows++
+	}
+	rows.Close()
+	if gotRows != 25 {
+		t.Fatalf("expected wire row cap of 25, got %d", gotRows)
+	}
+	if len(notices) == 0 || !strings.Contains(notices[0], "truncated to 25 rows") {
+		t.Fatalf("expected pgveil truncation NOTICE, got %v", notices)
+	}
+
+	// 4. Live Synchronous HITL Approval Hold: UPDATE pauses until operator approves!
+	go func() {
+		for i := 0; i < 100; i++ {
+			pending := hitlMgr.List("PENDING")
+			if len(pending) > 0 {
+				_, _ = hitlMgr.Resolve(pending[0].ID, true, "test-dba", "approved in test")
+				return
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+	}()
+	tag, err := conn.Exec(ctx, "UPDATE orders SET status = 'refunded' WHERE id = 1001")
+	if err != nil {
+		t.Fatalf("HITL-approved UPDATE failed: %v", err)
+	}
+	if tag.String() != "UPDATE 1" {
+		t.Fatalf("expected UPDATE 1, got %q", tag.String())
+	}
+
+	// Verify audit bus recorded all 4 events cleanly
+	sum := bus.Summary()
+	if sum.TotalQueries < 4 || sum.BlockedQueries < 1 || sum.TotalPIIFields < 5 || sum.TruncatedQueries < 1 || sum.HITLTriggered < 1 {
+		t.Fatalf("unexpected audit summary: %+v", sum)
+	}
+}

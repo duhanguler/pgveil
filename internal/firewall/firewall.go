@@ -1,0 +1,744 @@
+package firewall
+
+import (
+	"fmt"
+	"strings"
+
+	"github.com/duhanguler/pgveil/internal/policy"
+	pg_query "github.com/pganalyze/pg_query_go/v6"
+)
+
+// Action is the firewall's enforcement verdict for a SQL query.
+type Action string
+
+const (
+	ActionAllow       Action = "ALLOW"
+	ActionBlock       Action = "BLOCK"
+	ActionRequireHITL Action = "REQUIRE_HITL"
+)
+
+// Decision holds the full AST inspection result for policy enforcement and auditing.
+type Decision struct {
+	Action        Action   `json:"action"`
+	StatementType string   `json:"statement_type"`
+	RiskLevel     string   `json:"risk_level"` // LOW, MEDIUM, HIGH, CRITICAL
+	Reason        string   `json:"reason"`
+	Rule          string   `json:"rule"`
+	Tables        []string `json:"tables"`
+	Fingerprint   string   `json:"fingerprint"`
+	HasSelectStar bool     `json:"has_select_star"`
+}
+
+// dangerousFunctions are PostgreSQL server-side functions that enable filesystem read/write,
+// OS command execution, SSRF/lateral movement, or DoS.
+var dangerousFunctions = map[string]bool{
+	"pg_read_file":              true,
+	"pg_read_binary_file":       true,
+	"pg_ls_dir":                 true,
+	"pg_ls_logdir":              true,
+	"pg_ls_waldir":              true,
+	"pg_stat_file":              true,
+	"pg_execute_server_program": true,
+	"lo_import":                 true,
+	"lo_export":                 true,
+	"lo_from_bytea":             true,
+	"lo_put":                    true,
+	"dblink":                    true,
+	"dblink_exec":               true,
+	"dblink_connect":            true,
+	"dblink_connect_u":          true,
+	"query_to_xml":              true,
+	"pg_terminate_backend":      true,
+	"pg_cancel_backend":         true,
+	"pg_reload_conf":            true,
+	"pg_rotate_logfile":         true,
+	"pg_switch_wal":             true,
+}
+
+// sensitiveSystemTables contain credential hashes or sensitive server internals.
+var sensitiveSystemTables = map[string]bool{
+	"pg_shadow":        true,
+	"pg_authid":        true,
+	"pg_auth_members":  true,
+	"pg_roles":         true,
+	"pg_user":          true,
+	"pg_file_settings": true,
+	"pg_hba_file_rules": true,
+}
+
+// safeClientHousekeepingStatements are non-data session commands sent automatically by drivers (pgx, psql, psycopg).
+var safeHousekeeping = map[string]bool{
+	"BEGIN": true, "COMMIT": true, "ROLLBACK": true, "SAVEPOINT": true,
+	"RELEASE": true, "DEALLOCATE": true, "DISCARD": true, "CLOSE": true,
+	"LISTEN": true, "UNLISTEN": true,
+}
+
+// Evaluate parses sql using PostgreSQL's own AST parser (libpg_query) and enforces the role's FirewallPolicy.
+func Evaluate(sql string, profile *policy.RoleProfile) Decision {
+	trimmed := strings.TrimSpace(sql)
+	if trimmed == "" || trimmed == ";" {
+		return Decision{
+			Action:        ActionAllow,
+			StatementType: "EMPTY",
+			RiskLevel:     "LOW",
+			Rule:          "empty_query",
+		}
+	}
+
+	fp, _ := pg_query.Fingerprint(trimmed)
+	if fp == "" {
+		fp = "unparseable"
+	}
+
+	if profile == nil {
+		return Decision{
+			Action:        ActionAllow,
+			StatementType: "UNKNOWN",
+			RiskLevel:     "LOW",
+			Fingerprint:   fp,
+		}
+	}
+	fw := profile.Firewall
+
+	// Admin wildcard with all guards disabled fast-path still parses for accurate auditing.
+	tree, err := pg_query.Parse(trimmed)
+	if err != nil {
+		if containsWildcard(fw.AllowStatements) && !fw.BlockMultiStatement {
+			return Decision{
+				Action:        ActionAllow,
+				StatementType: "RAW",
+				RiskLevel:     "LOW",
+				Fingerprint:   fp,
+			}
+		}
+		return Decision{
+			Action:        ActionBlock,
+			StatementType: "PARSE_ERROR",
+			RiskLevel:     "HIGH",
+			Reason:        fmt.Sprintf("SQL syntax rejected by AST parser: %v", err),
+			Rule:          "ast_parse_error",
+			Fingerprint:   fp,
+		}
+	}
+
+	if len(tree.Stmts) == 0 {
+		return Decision{
+			Action:        ActionAllow,
+			StatementType: "EMPTY",
+			RiskLevel:     "LOW",
+			Fingerprint:   fp,
+		}
+	}
+
+	// 1. Multi-statement SQL injection protection
+	if fw.BlockMultiStatement && len(tree.Stmts) > 1 {
+		return Decision{
+			Action:        ActionBlock,
+			StatementType: "MULTI_STATEMENT",
+			RiskLevel:     "CRITICAL",
+			Reason:        fmt.Sprintf("Multi-statement query (%d statements) blocked by policy", len(tree.Stmts)),
+			Rule:          "block_multi_statement",
+			Fingerprint:   fp,
+		}
+	}
+
+	analysis := analyzeAST(tree)
+	dec := Decision{
+		StatementType: analysis.primaryType,
+		Tables:        analysis.tables,
+		Fingerprint:   fp,
+		HasSelectStar: analysis.hasSelectStar,
+		RiskLevel:     "LOW",
+	}
+
+	// 2. Dangerous server functions, COPY TO PROGRAM, DO blocks, privilege escalation
+	if fw.BlockDangerousFunctions {
+		if len(analysis.dangerousFuncs) > 0 {
+			dec.Action = ActionBlock
+			dec.RiskLevel = "CRITICAL"
+			dec.Rule = "block_dangerous_functions"
+			dec.Reason = fmt.Sprintf("Dangerous PostgreSQL function blocked: %s", strings.Join(analysis.dangerousFuncs, ", "))
+			return dec
+		}
+		if analysis.hasCopyProgram {
+			dec.Action = ActionBlock
+			dec.RiskLevel = "CRITICAL"
+			dec.Rule = "block_copy_program"
+			dec.Reason = "COPY TO/FROM PROGRAM or server filesystem access is blocked"
+			return dec
+		}
+		if analysis.hasDoBlock {
+			dec.Action = ActionBlock
+			dec.RiskLevel = "CRITICAL"
+			dec.Rule = "block_do_block"
+			dec.Reason = "Anonymous procedural DO $$ blocks are blocked by policy"
+			return dec
+		}
+		if analysis.hasRoleEscalation {
+			dec.Action = ActionBlock
+			dec.RiskLevel = "CRITICAL"
+			dec.Rule = "block_role_escalation"
+			dec.Reason = "SET ROLE / SET SESSION AUTHORIZATION privilege escalation is blocked"
+			return dec
+		}
+	}
+
+	// 3. DDL Blocking (including ALTER SYSTEM, DROP, TRUNCATE, CREATE, GRANT, REVOKE)
+	if fw.BlockDDL && analysis.isDDL {
+		dec.Action = ActionBlock
+		dec.RiskLevel = "CRITICAL"
+		dec.Rule = "block_ddl"
+		dec.Reason = fmt.Sprintf("DDL / privilege statement (%s) is blocked for profile %q", analysis.primaryType, profile.Name)
+		return dec
+	}
+
+	// 4. Write without WHERE or tautological WHERE (e.g., DELETE FROM orders WHERE 1=1)
+	if fw.BlockWriteWithoutWhere && analysis.writeWithoutWhere {
+		dec.Action = ActionBlock
+		dec.RiskLevel = "CRITICAL"
+		dec.Rule = "block_write_without_where"
+		dec.Reason = fmt.Sprintf("Unscoped %s without effective WHERE clause (or tautology like 1=1) is blocked", analysis.primaryType)
+		return dec
+	}
+
+	// 5. Table Denylist, System Catalog Lockout & Allowlist
+	deniedSet := toLowerSet(fw.DeniedTables)
+	allowedSet := toLowerSet(fw.AllowedTables)
+	for _, tbl := range analysis.tables {
+		lt := strings.ToLower(tbl)
+		bare := stripSchema(lt)
+		if deniedSet[lt] || deniedSet[bare] {
+			dec.Action = ActionBlock
+			dec.RiskLevel = "HIGH"
+			dec.Rule = "denied_table"
+			dec.Reason = fmt.Sprintf("Access to restricted table %q is denied for profile %q", tbl, profile.Name)
+			return dec
+		}
+		if fw.BlockSystemCatalogs && (sensitiveSystemTables[bare] || strings.HasPrefix(lt, "pg_catalog.pg_auth") || strings.HasPrefix(lt, "pg_catalog.pg_shadow")) {
+			dec.Action = ActionBlock
+			dec.RiskLevel = "HIGH"
+			dec.Rule = "block_system_catalogs"
+			dec.Reason = fmt.Sprintf("Access to sensitive system catalog %q is blocked", tbl)
+			return dec
+		}
+		if len(allowedSet) > 0 && !allowedSet[lt] && !allowedSet[bare] {
+			dec.Action = ActionBlock
+			dec.RiskLevel = "HIGH"
+			dec.Rule = "table_not_allowed"
+			dec.Reason = fmt.Sprintf("Table %q is outside allowed_tables for profile %q", tbl, profile.Name)
+			return dec
+		}
+	}
+
+	// 6. Optional SELECT * guard on tables
+	if fw.BlockSelectStarOnPII && analysis.hasSelectStar && len(analysis.tables) > 0 {
+		dec.Action = ActionBlock
+		dec.RiskLevel = "MEDIUM"
+		dec.Rule = "block_select_star"
+		dec.Reason = "SELECT * is disabled for this profile; explicitly project required columns"
+		return dec
+	}
+
+	// 7. Human-in-the-Loop (HITL) Approval Trigger (checks primary statement AND modifying CTEs!)
+	hitlSet := toUpperSet(fw.RequireHITLStatements)
+	for _, st := range analysis.allTypes {
+		if hitlSet[st] {
+			dec.Action = ActionRequireHITL
+			dec.RiskLevel = "HIGH"
+			dec.Rule = "require_hitl_" + strings.ToLower(st)
+			dec.Reason = fmt.Sprintf("Statement %s requires Human-in-the-Loop approval for profile %q", st, profile.Name)
+			return dec
+		}
+	}
+
+	// 8. Statement Allowlist (safe transaction housekeeping allowed unless explicitly destructive)
+	if !containsWildcard(fw.AllowStatements) {
+		allowSet := toUpperSet(fw.AllowStatements)
+		for _, st := range analysis.allTypes {
+			if allowSet[st] || safeHousekeeping[st] {
+				continue
+			}
+			// Allow benign SET client_encoding / application_name / search_path from drivers
+			if st == "SET" && !analysis.hasRoleEscalation {
+				continue
+			}
+			dec.Action = ActionBlock
+			dec.RiskLevel = "HIGH"
+			dec.Rule = "statement_not_allowed"
+			dec.Reason = fmt.Sprintf("Statement type %s is not permitted for profile %q", st, profile.Name)
+			return dec
+		}
+	}
+
+	dec.Action = ActionAllow
+	dec.Rule = "policy_allow"
+	dec.Reason = "Query passed AST firewall inspection"
+	return dec
+}
+
+type astAnalysis struct {
+	primaryType       string
+	allTypes          []string
+	tables            []string
+	dangerousFuncs    []string
+	isDDL             bool
+	writeWithoutWhere bool
+	hasCopyProgram    bool
+	hasDoBlock        bool
+	hasRoleEscalation bool
+	hasSelectStar     bool
+}
+
+func analyzeAST(tree *pg_query.ParseResult) astAnalysis {
+	var res astAnalysis
+	tableSeen := make(map[string]bool)
+	funcSeen := make(map[string]bool)
+	typeSeen := make(map[string]bool)
+
+	addType := func(t string) {
+		if res.primaryType == "" {
+			res.primaryType = t
+		}
+		if !typeSeen[t] {
+			typeSeen[t] = true
+			res.allTypes = append(res.allTypes, t)
+		}
+	}
+	addTable := func(rv *pg_query.RangeVar) {
+		if rv == nil || rv.Relname == "" {
+			return
+		}
+		name := rv.Relname
+		if rv.Schemaname != "" {
+			name = rv.Schemaname + "." + rv.Relname
+		}
+		low := strings.ToLower(name)
+		if !tableSeen[low] {
+			tableSeen[low] = true
+			res.tables = append(res.tables, low)
+		}
+	}
+	addFunc := func(fn *pg_query.FuncCall) {
+		if fn == nil || len(fn.Funcname) == 0 {
+			return
+		}
+		last := fn.Funcname[len(fn.Funcname)-1]
+		if s := last.GetString_(); s != nil {
+			name := strings.ToLower(s.Sval)
+			if dangerousFunctions[name] && !funcSeen[name] {
+				funcSeen[name] = true
+				res.dangerousFuncs = append(res.dangerousFuncs, name)
+			}
+		}
+	}
+
+	var walkNode func(n *pg_query.Node)
+	walkNode = func(n *pg_query.Node) {
+		if n == nil {
+			return
+		}
+		switch inner := n.Node.(type) {
+		case *pg_query.Node_SelectStmt:
+			s := inner.SelectStmt
+			addType("SELECT")
+			if s.WithClause != nil {
+				for _, cte := range s.WithClause.Ctes {
+					walkNode(cte)
+				}
+			}
+			for _, tl := range s.TargetList {
+				walkNode(tl)
+			}
+			for _, fc := range s.FromClause {
+				walkNode(fc)
+			}
+			walkNode(s.WhereClause)
+			for _, g := range s.GroupClause {
+				walkNode(g)
+			}
+			walkNode(s.HavingClause)
+			walkNode(s.LimitCount)
+			walkNode(s.LimitOffset)
+			if s.Larg != nil {
+				walkNode(&pg_query.Node{Node: &pg_query.Node_SelectStmt{SelectStmt: s.Larg}})
+			}
+			if s.Rarg != nil {
+				walkNode(&pg_query.Node{Node: &pg_query.Node_SelectStmt{SelectStmt: s.Rarg}})
+			}
+
+		case *pg_query.Node_InsertStmt:
+			ins := inner.InsertStmt
+			addType("INSERT")
+			addTable(ins.Relation)
+			if ins.WithClause != nil {
+				for _, cte := range ins.WithClause.Ctes {
+					walkNode(cte)
+				}
+			}
+			walkNode(ins.SelectStmt)
+			for _, r := range ins.ReturningList {
+				walkNode(r)
+			}
+
+		case *pg_query.Node_UpdateStmt:
+			upd := inner.UpdateStmt
+			addType("UPDATE")
+			addTable(upd.Relation)
+			if upd.WhereClause == nil || isTautology(upd.WhereClause) {
+				res.writeWithoutWhere = true
+			}
+			if upd.WithClause != nil {
+				for _, cte := range upd.WithClause.Ctes {
+					walkNode(cte)
+				}
+			}
+			for _, t := range upd.TargetList {
+				walkNode(t)
+			}
+			for _, fc := range upd.FromClause {
+				walkNode(fc)
+			}
+			walkNode(upd.WhereClause)
+			for _, r := range upd.ReturningList {
+				walkNode(r)
+			}
+
+		case *pg_query.Node_DeleteStmt:
+			del := inner.DeleteStmt
+			addType("DELETE")
+			addTable(del.Relation)
+			if del.WhereClause == nil || isTautology(del.WhereClause) {
+				res.writeWithoutWhere = true
+			}
+			if del.WithClause != nil {
+				for _, cte := range del.WithClause.Ctes {
+					walkNode(cte)
+				}
+			}
+			for _, u := range del.UsingClause {
+				walkNode(u)
+			}
+			walkNode(del.WhereClause)
+			for _, r := range del.ReturningList {
+				walkNode(r)
+			}
+
+		case *pg_query.Node_DropStmt:
+			addType("DROP")
+			res.isDDL = true
+			for _, obj := range inner.DropStmt.Objects {
+				extractDropTable(obj, addTable)
+			}
+
+		case *pg_query.Node_TruncateStmt:
+			addType("TRUNCATE")
+			res.isDDL = true
+			for _, rel := range inner.TruncateStmt.Relations {
+				walkNode(rel)
+			}
+
+		case *pg_query.Node_AlterTableStmt:
+			addType("ALTER")
+			res.isDDL = true
+			addTable(inner.AlterTableStmt.Relation)
+
+		case *pg_query.Node_CreateStmt:
+			addType("CREATE")
+			res.isDDL = true
+			addTable(inner.CreateStmt.Relation)
+
+		case *pg_query.Node_IndexStmt:
+			addType("CREATE_INDEX")
+			res.isDDL = true
+			addTable(inner.IndexStmt.Relation)
+
+		case *pg_query.Node_ViewStmt:
+			addType("CREATE_VIEW")
+			res.isDDL = true
+			addTable(inner.ViewStmt.View)
+			walkNode(inner.ViewStmt.Query)
+
+		case *pg_query.Node_CreateFunctionStmt:
+			addType("CREATE_FUNCTION")
+			res.isDDL = true
+
+		case *pg_query.Node_GrantStmt:
+			addType("GRANT")
+			res.isDDL = true
+
+		case *pg_query.Node_GrantRoleStmt:
+			addType("GRANT_ROLE")
+			res.isDDL = true
+
+		case *pg_query.Node_AlterSystemStmt:
+			addType("ALTER_SYSTEM")
+			res.isDDL = true
+
+		case *pg_query.Node_CopyStmt:
+			addType("COPY")
+			addTable(inner.CopyStmt.Relation)
+			walkNode(inner.CopyStmt.Query)
+			if inner.CopyStmt.IsProgram || inner.CopyStmt.Filename != "" {
+				res.hasCopyProgram = true
+			}
+
+		case *pg_query.Node_DoStmt:
+			addType("DO")
+			res.hasDoBlock = true
+
+		case *pg_query.Node_ExplainStmt:
+			addType("EXPLAIN")
+			walkNode(inner.ExplainStmt.Query)
+
+		case *pg_query.Node_VariableShowStmt:
+			addType("SHOW")
+
+		case *pg_query.Node_VariableSetStmt:
+			addType("SET")
+			vname := strings.ToLower(inner.VariableSetStmt.Name)
+			if vname == "role" || vname == "session_authorization" {
+				res.hasRoleEscalation = true
+			}
+
+		case *pg_query.Node_TransactionStmt:
+			switch inner.TransactionStmt.Kind {
+			case pg_query.TransactionStmtKind_TRANS_STMT_BEGIN, pg_query.TransactionStmtKind_TRANS_STMT_START:
+				addType("BEGIN")
+			case pg_query.TransactionStmtKind_TRANS_STMT_COMMIT:
+				addType("COMMIT")
+			case pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK, pg_query.TransactionStmtKind_TRANS_STMT_ROLLBACK_TO:
+				addType("ROLLBACK")
+			case pg_query.TransactionStmtKind_TRANS_STMT_SAVEPOINT:
+				addType("SAVEPOINT")
+			case pg_query.TransactionStmtKind_TRANS_STMT_RELEASE:
+				addType("RELEASE")
+			default:
+				addType("TRANSACTION")
+			}
+
+		case *pg_query.Node_DeallocateStmt:
+			addType("DEALLOCATE")
+
+		case *pg_query.Node_DiscardStmt:
+			addType("DISCARD")
+
+		case *pg_query.Node_CommonTableExpr:
+			walkNode(inner.CommonTableExpr.Ctequery)
+
+		case *pg_query.Node_RangeVar:
+			addTable(inner.RangeVar)
+
+		case *pg_query.Node_RangeSubselect:
+			walkNode(inner.RangeSubselect.Subquery)
+
+		case *pg_query.Node_RangeFunction:
+			for _, f := range inner.RangeFunction.Functions {
+				walkNode(f)
+			}
+
+		case *pg_query.Node_JoinExpr:
+			walkNode(inner.JoinExpr.Larg)
+			walkNode(inner.JoinExpr.Rarg)
+			walkNode(inner.JoinExpr.Quals)
+
+		case *pg_query.Node_ResTarget:
+			walkNode(inner.ResTarget.Val)
+
+		case *pg_query.Node_ColumnRef:
+			for _, f := range inner.ColumnRef.Fields {
+				if f.GetAStar() != nil {
+					res.hasSelectStar = true
+				}
+			}
+
+		case *pg_query.Node_FuncCall:
+			addFunc(inner.FuncCall)
+			for _, arg := range inner.FuncCall.Args {
+				walkNode(arg)
+			}
+
+		case *pg_query.Node_AExpr:
+			walkNode(inner.AExpr.Lexpr)
+			walkNode(inner.AExpr.Rexpr)
+
+		case *pg_query.Node_BoolExpr:
+			for _, arg := range inner.BoolExpr.Args {
+				walkNode(arg)
+			}
+
+		case *pg_query.Node_SubLink:
+			walkNode(inner.SubLink.Subselect)
+			walkNode(inner.SubLink.Testexpr)
+
+		case *pg_query.Node_TypeCast:
+			walkNode(inner.TypeCast.Arg)
+
+		case *pg_query.Node_CaseExpr:
+			walkNode(inner.CaseExpr.Arg)
+			for _, w := range inner.CaseExpr.Args {
+				walkNode(w)
+			}
+			walkNode(inner.CaseExpr.Defresult)
+
+		case *pg_query.Node_CaseWhen:
+			walkNode(inner.CaseWhen.Expr)
+			walkNode(inner.CaseWhen.Result)
+
+		case *pg_query.Node_CoalesceExpr:
+			for _, a := range inner.CoalesceExpr.Args {
+				walkNode(a)
+			}
+
+		case *pg_query.Node_List:
+			for _, item := range inner.List.Items {
+				walkNode(item)
+			}
+		}
+	}
+
+	for _, raw := range tree.Stmts {
+		if raw != nil && raw.Stmt != nil {
+			walkNode(raw.Stmt)
+		}
+	}
+
+	// If a SELECT wraps a modifying CTE (WITH d AS (DELETE ...) SELECT ...), elevate primaryType so audit & HITL reflect the write!
+	for _, st := range res.allTypes {
+		if st == "DELETE" || st == "UPDATE" || st == "INSERT" {
+			res.primaryType = st
+			break
+		}
+	}
+
+	if res.primaryType == "" {
+		res.primaryType = "OTHER"
+	}
+	return res
+}
+
+// isTautology detects trivially always-true WHERE predicates such as WHERE true, WHERE 1=1,
+// WHERE 'a'='a', or WHERE cond OR 1=1 (common SQL injection / AI agent bypasses).
+func isTautology(n *pg_query.Node) bool {
+	if n == nil {
+		return true
+	}
+	switch v := n.Node.(type) {
+	case *pg_query.Node_AConst:
+		if b := v.AConst.GetBoolval(); b != nil && b.Boolval {
+			return true
+		}
+		if iv := v.AConst.GetIval(); iv != nil && iv.Ival != 0 {
+			return true
+		}
+	case *pg_query.Node_TypeCast:
+		return isTautology(v.TypeCast.Arg)
+	case *pg_query.Node_BoolExpr:
+		switch v.BoolExpr.Boolop {
+		case pg_query.BoolExprType_OR_EXPR:
+			for _, arg := range v.BoolExpr.Args {
+				if isTautology(arg) {
+					return true
+				}
+			}
+		case pg_query.BoolExprType_AND_EXPR:
+			allTrue := len(v.BoolExpr.Args) > 0
+			for _, arg := range v.BoolExpr.Args {
+				if !isTautology(arg) {
+					allTrue = false
+					break
+				}
+			}
+			return allTrue
+		case pg_query.BoolExprType_NOT_EXPR:
+			if len(v.BoolExpr.Args) == 1 {
+				if ac := v.BoolExpr.Args[0].GetAConst(); ac != nil {
+					if b := ac.GetBoolval(); b != nil && !b.Boolval {
+						return true
+					}
+				}
+			}
+		}
+	case *pg_query.Node_AExpr:
+		if v.AExpr.Kind == pg_query.A_Expr_Kind_AEXPR_OP && len(v.AExpr.Name) == 1 {
+			if op := v.AExpr.Name[0].GetString_(); op != nil && op.Sval == "=" {
+				return sameConstant(v.AExpr.Lexpr, v.AExpr.Rexpr)
+			}
+		}
+	}
+	return false
+}
+
+func sameConstant(a, b *pg_query.Node) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	ac, bc := a.GetAConst(), b.GetAConst()
+	if ac == nil || bc == nil {
+		return false
+	}
+	if ai, bi := ac.GetIval(), bc.GetIval(); ai != nil && bi != nil {
+		return ai.Ival == bi.Ival
+	}
+	if as, bs := ac.GetSval(), bc.GetSval(); as != nil && bs != nil {
+		return as.Sval == bs.Sval
+	}
+	if ab, bb := ac.GetBoolval(), bc.GetBoolval(); ab != nil && bb != nil {
+		return ab.Boolval == bb.Boolval
+	}
+	return false
+}
+
+func extractDropTable(obj *pg_query.Node, addTable func(*pg_query.RangeVar)) {
+	if obj == nil {
+		return
+	}
+	if list := obj.GetList(); list != nil && len(list.Items) > 0 {
+		parts := make([]string, 0, len(list.Items))
+		for _, item := range list.Items {
+			if s := item.GetString_(); s != nil {
+				parts = append(parts, s.Sval)
+			}
+		}
+		if len(parts) == 1 {
+			addTable(&pg_query.RangeVar{Relname: parts[0]})
+		} else if len(parts) >= 2 {
+			addTable(&pg_query.RangeVar{Schemaname: parts[0], Relname: parts[1]})
+		}
+	}
+}
+
+func containsWildcard(list []string) bool {
+	for _, s := range list {
+		if strings.TrimSpace(s) == "*" {
+			return true
+		}
+	}
+	return false
+}
+
+func toLowerSet(items []string) map[string]bool {
+	m := make(map[string]bool, len(items))
+	for _, it := range items {
+		if s := strings.ToLower(strings.TrimSpace(it)); s != "" {
+			m[s] = true
+		}
+	}
+	return m
+}
+
+func toUpperSet(items []string) map[string]bool {
+	m := make(map[string]bool, len(items))
+	for _, it := range items {
+		if s := strings.ToUpper(strings.TrimSpace(it)); s != "" {
+			m[s] = true
+		}
+	}
+	return m
+}
+
+func stripSchema(name string) string {
+	if idx := strings.LastIndexByte(name, '.'); idx >= 0 {
+		return name[idx+1:]
+	}
+	return name
+}

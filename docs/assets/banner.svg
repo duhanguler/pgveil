@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 320" width="1200" height="320">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#020617"/>
+      <stop offset="55%" stop-color="#0b1224"/>
+      <stop offset="100%" stop-color="#042f2e"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#10b981"/>
+      <stop offset="100%" stop-color="#06b6d4"/>
+    </linearGradient>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+      <path d="M 32 0 L 0 0 0 32" fill="none" stroke="#1e293b" stroke-width="0.6" opacity="0.45"/>
+    </pattern>
+  </defs>
+
+  <rect width="1200" height="320" rx="18" fill="url(#bg)"/>
+  <rect width="1200" height="320" rx="18" fill="url(#grid)"/>
+  <rect x="1" y="1" width="1198" height="318" rx="17" fill="none" stroke="#1e293b" stroke-width="2"/>
+
+  <!-- Shield Emblem -->
+  <g transform="translate(68, 66)">
+    <rect x="0" y="0" width="84" height="84" rx="18" fill="url(#accent)" opacity="0.16" stroke="#10b981" stroke-width="2"/>
+    <path d="M42 16 L66 26 V44 C66 59 55 68 42 73 C29 68 18 59 18 44 V26 Z" fill="none" stroke="url(#accent)" stroke-width="4" stroke-linejoin="round"/>
+    <path d="M32 43 L39 50 L53 35" fill="none" stroke="#34d399" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+
+  <!-- Title & Tagline -->
+  <text x="176" y="114" fill="#f8fafc" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="54" font-weight="800" letter-spacing="-1.5">pgveil</text>
+  <rect x="352" y="80" width="174" height="28" rx="14" fill="#10b981" fill-opacity="0.14" stroke="#10b981" stroke-opacity="0.45"/>
+  <text x="439" y="99" text-anchor="middle" fill="#6ee7b7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" font-weight="700">WIRE PROTOCOL v3</text>
+
+  <text x="176" y="152" fill="#cbd5e1" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="20" font-weight="400">Zero-Trust PostgreSQL Dynamic PII Masking &amp; AI-Agent SQL Firewall Proxy</text>
+
+  <!-- Feature Pills -->
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12.5" font-weight="600">
+    <rect x="68" y="192" width="194" height="32" rx="8" fill="#0f172a" stroke="#334155"/>
+    <text x="165" y="213" text-anchor="middle" fill="#34d399">PostgreSQL 17 AST</text>
+
+    <rect x="274" y="192" width="234" height="32" rx="8" fill="#0f172a" stroke="#334155"/>
+    <text x="391" y="213" text-anchor="middle" fill="#38bdf8">GDPR · KVKK · PCI · HIPAA</text>
+
+    <rect x="520" y="192" width="198" height="32" rx="8" fill="#0f172a" stroke="#334155"/>
+    <text x="619" y="213" text-anchor="middle" fill="#fbbf24">Live HITL Wire Hold</text>
+
+    <rect x="730" y="192" width="176" height="32" rx="8" fill="#0f172a" stroke="#334155"/>
+    <text x="818" y="213" text-anchor="middle" fill="#c084fc">Kafka + OTel + K8s</text>
+
+    <rect x="918" y="192" width="214" height="32" rx="8" fill="#0f172a" stroke="#334155"/>
+    <text x="1025" y="213" text-anchor="middle" fill="#f8fafc">1-Line Port Swap (:6432)</text>
+  </g>
+
+  <!-- Wire Flow Strip -->
+  <g transform="translate(68, 246)" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12">
+    <rect x="0" y="0" width="236" height="42" rx="8" fill="#0f172a" stroke="#1e293b"/>
+    <text x="118" y="25" text-anchor="middle" fill="#94a3b8">Claude MCP · psql · pgx</text>
+
+    <path d="M 244 21 L 288 21" stroke="#10b981" stroke-width="2" stroke-dasharray="4 3"/>
+    <polygon points="292,21 284,16 284,26" fill="#10b981"/>
+
+    <rect x="298" y="0" width="382" height="42" rx="8" fill="#064e3b" fill-opacity="0.45" stroke="#10b981" stroke-width="1.5"/>
+    <text x="489" y="25" text-anchor="middle" fill="#6ee7b7" font-weight="700">pgveil (:6432)  AST Guard + Wire Masker</text>
+
+    <path d="M 688 21 L 732 21" stroke="#06b6d4" stroke-width="2" stroke-dasharray="4 3"/>
+    <polygon points="736,21 728,16 728,26" fill="#06b6d4"/>
+
+    <rect x="742" y="0" width="164" height="42" rx="8" fill="#0f172a" stroke="#1e293b"/>
+    <text x="824" y="25" text-anchor="middle" fill="#e2e8f0">PostgreSQL 14–17</text>
+
+    <rect x="920" y="0" width="144" height="42" rx="8" fill="#1e1b4b" fill-opacity="0.7" stroke="#6366f1"/>
+    <text x="992" y="25" text-anchor="middle" fill="#a5b4fc">Kafka + OTel</text>
+  </g>
+</svg>

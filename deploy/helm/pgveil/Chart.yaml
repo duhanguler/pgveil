@@ -1,0 +1,21 @@
+apiVersion: v2
+name: pgveil
+description: Zero-Trust PostgreSQL Wire-Protocol Dynamic PII Masking & AI-Agent SQL Firewall Proxy
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - postgresql
+  - security
+  - pii-masking
+  - sql-firewall
+  - ai-agents
+  - mcp
+  - kvkk
+  - gdpr
+home: https://github.com/duhanguler/pgveil
+sources:
+  - https://github.com/duhanguler/pgveil
+maintainers:
+  - name: Duhan Güler
+    url: https://github.com/duhanguler

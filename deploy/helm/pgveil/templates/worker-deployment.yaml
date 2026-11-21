@@ -1,0 +1,56 @@
+{{- if .Values.auditWorker.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "pgveil.fullname" . }}-audit-worker
+  labels:
+    {{- include "pgveil.labels" . | nindent 4 }}
+    app.kubernetes.io/component: audit-worker
+spec:
+  replicas: {{ .Values.auditWorker.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "pgveil.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: audit-worker
+  template:
+    metadata:
+      labels:
+        {{- include "pgveil.labels" . | nindent 8 }}
+        app.kubernetes.io/component: audit-worker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "{{ .Values.auditWorker.metricsPort }}"
+        prometheus.io/path: "/metrics"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+      containers:
+        - name: audit-worker
+          image: "{{ .Values.auditWorker.image.repository }}:{{ .Values.auditWorker.image.tag }}"
+          imagePullPolicy: {{ .Values.auditWorker.image.pullPolicy }}
+          ports:
+            - name: metrics
+              containerPort: {{ .Values.auditWorker.metricsPort }}
+          env:
+            - name: PGVEIL_KAFKA_BROKERS
+              value: {{ join "," .Values.kafka.brokers | quote }}
+            - name: PGVEIL_DATABASE_URL
+              value: {{ .Values.auditWorker.databaseURL | quote }}
+            - name: PGVEIL_WORKER_ADDR
+              value: ":{{ .Values.auditWorker.metricsPort }}"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            {{- toYaml .Values.auditWorker.resources | nindent 12 }}
+{{- end }}

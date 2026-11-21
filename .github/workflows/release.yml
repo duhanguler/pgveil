@@ -19,7 +19,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-      - run: cd web && npm ci && npm run build
+      - run: cd web && npm ci && npm run build && touch ../internal/webui/dist/.gitkeep
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod

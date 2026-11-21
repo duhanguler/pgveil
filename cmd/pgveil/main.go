@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/duhanguler/pgveil/internal/api"
+	"github.com/duhanguler/pgveil/internal/demo"
 	"github.com/duhanguler/pgveil/internal/discover"
 	"github.com/duhanguler/pgveil/internal/events"
 	"github.com/duhanguler/pgveil/internal/firewall"
@@ -28,7 +29,7 @@ import (
 )
 
 var (
-	version = "0.3.2"
+	version = "0.4.0"
 	commit  = "dev"
 )
 
@@ -38,6 +39,10 @@ func main() {
 		os.Exit(0)
 	}
 	switch os.Args[1] {
+	case "demo":
+		runDemo(os.Args[2:])
+	case "init":
+		runInit(os.Args[2:])
 	case "serve":
 		runServe(os.Args[2:])
 	case "validate":
@@ -60,15 +65,193 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Println(`pgveil — Zero-Trust PostgreSQL Wire-Protocol PII Masking & AI-Agent SQL Firewall Proxy
+	fmt.Println(`pgveil — Zero-Trust PostgreSQL Wire-Protocol PII Masking, Virtual RLS & AI-Agent SQL Firewall Proxy
 
 Usage:
+  pgveil demo     [--listen :6432] [--admin :8088] [--log-level info]
+  pgveil init     --dsn postgres://... [--output pgveil.yaml] [--sample-rows 50] [--force]
   pgveil serve    [--config configs/pgveil.yaml] [--log-level info]
   pgveil discover [--dsn postgres://...] [--config configs/pgveil.yaml] [--format table|yaml|json] [--sample-rows 50]
   pgveil mcp      [--config configs/pgveil.yaml] [--profile ai_agent] [--dsn postgres://...]
   pgveil scan     --sql "SELECT ..." [--profile ai_agent] [--config configs/pgveil.yaml]
   pgveil validate [--config configs/pgveil.yaml]
   pgveil version`)
+}
+
+func runDemo(args []string) {
+	fs := flag.NewFlagSet("demo", flag.ExitOnError)
+	listenAddr := fs.String("listen", ":6432", "Wire proxy listen address")
+	adminAddr := fs.String("admin", ":8088", "Web Console & Control Plane HTTP address")
+	logLevel := fs.String("log-level", "warn", "Log level (debug, info, warn, error)")
+	_ = fs.Parse(args)
+
+	initLogger(*logLevel)
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	demoPG := demo.NewServer()
+	upstreamAddr, err := demoPG.Start(ctx, "127.0.0.1:0")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to start embedded demo PostgreSQL backend: %v\n", err)
+		os.Exit(1)
+	}
+
+	policyMgr, err := policy.LoadBytes(demo.BuildDemoConfigYAML(*listenAddr, *adminAddr, upstreamAddr))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to compile demo configuration: %v\n", err)
+		os.Exit(1)
+	}
+	cfg := policyMgr.Config()
+
+	reg := prometheus.NewRegistry()
+	metrics := telemetry.NewMetrics(reg)
+	tracer, shutdownTracer := telemetry.InitTracer(ctx, cfg.Telemetry.ServiceName, false, "")
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = shutdownTracer(sctx)
+	}()
+
+	hitlMgr := hitl.NewManager(250)
+	eventBus := events.NewBus(500, cfg.Kafka, metrics)
+	defer eventBus.Close()
+
+	wireProxy, err := proxy.NewServer(policyMgr, hitlMgr, eventBus, metrics, tracer)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to initialize wire proxy: %v\n", err)
+		os.Exit(1)
+	}
+
+	distFS, _ := webui.DistFS()
+	apiSrv := api.NewServer(policyMgr, hitlMgr, eventBus, wireProxy.Addr, reg, distFS, version)
+	httpSrv := &http.Server{
+		Addr:              cfg.Server.AdminAddr,
+		Handler:           apiSrv.Handler(),
+		ReadHeaderTimeout: 10 * time.Second,
+	}
+
+	errCh := make(chan error, 2)
+	go func() {
+		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			errCh <- fmt.Errorf("admin server: %w", err)
+		}
+	}()
+	go func() {
+		if err := wireProxy.Start(ctx); err != nil {
+			errCh <- fmt.Errorf("wire proxy: %w", err)
+		}
+	}()
+
+	// Wait briefly for proxy listener to bind before printing banner
+	deadline := time.Now().Add(2 * time.Second)
+	for wireProxy.Addr() == "" && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	uiURL := formatDisplayURL(*adminAddr)
+	wireHostPort := formatDisplayHostPort(*listenAddr)
+	fmt.Printf(`
+pgveil v%s — Interactive Zero-Config Sandbox (No Docker / No External PostgreSQL)
+────────────────────────────────────────────────────────────────────────────────
+  Web Workbench:   %s
+  Wire Proxy:      %s  (backed by embedded PG16 demo engine on %s)
+  Seeded Tables:   customers (40) · orders (8) · payments (5) · support_tickets (4) · api_secrets (3)
+
+Try live from another terminal:
+  # 1) AI-Agent masked PII + AST firewall:
+  psql "postgres://pgveil@%s/pgveil_demo?sslmode=disable&application_name=ai_agent" \
+       -c "SELECT id, full_name, email, tckn, city FROM customers LIMIT 5;"
+
+  # 2) AST Virtual Row-Level Security (auto-injects city='Istanbul' & currency='TRY'):
+  psql "postgres://pgveil@%s/pgveil_demo?sslmode=disable&application_name=tenant_tr" \
+       -c "SELECT id, full_name, city, tckn FROM customers;"
+
+Press Ctrl+C to stop.
+`, version, uiURL, wireHostPort, upstreamAddr, wireHostPort, wireHostPort)
+
+	select {
+	case <-ctx.Done():
+		fmt.Println("\nShutting down pgveil demo...")
+		shutCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = httpSrv.Shutdown(shutCtx)
+	case err := <-errCh:
+		fmt.Fprintf(os.Stderr, "demo server error: %v\n", err)
+		stop()
+		os.Exit(1)
+	}
+}
+
+func runInit(args []string) {
+	fs := flag.NewFlagSet("init", flag.ExitOnError)
+	dsn := fs.String("dsn", "", "PostgreSQL connection URI to scan (required)")
+	output := fs.String("output", "pgveil.yaml", "Output path for generated configuration file")
+	sampleRows := fs.Int("sample-rows", 50, "Max non-null rows sampled per column during discovery")
+	force := fs.Bool("force", false, "Overwrite output file if it already exists")
+	_ = fs.Parse(args)
+
+	if strings.TrimSpace(*dsn) == "" {
+		fmt.Fprintln(os.Stderr, "error: --dsn is required (e.g. pgveil init --dsn postgres://user:pass@localhost:5432/mydb)")
+		os.Exit(1)
+	}
+	if !*force {
+		if _, err := os.Stat(*output); err == nil {
+			fmt.Fprintf(os.Stderr, "error: %q already exists (pass --force to overwrite)\n", *output)
+			os.Exit(1)
+		}
+	}
+
+	fmt.Printf("Scanning PostgreSQL schema for PII & secrets (up to %d rows/column)...\n", *sampleRows)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	report, err := discover.Scan(ctx, *dsn, *sampleRows, "pgveil-init-preview")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "discovery failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	yml, err := discover.GenerateStarterConfig(report, *dsn)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to synthesize config: %v\n", err)
+		os.Exit(1)
+	}
+	if _, err := policy.LoadBytes([]byte(yml)); err != nil {
+		fmt.Fprintf(os.Stderr, "internal error: synthesized config failed validation: %v\n", err)
+		os.Exit(1)
+	}
+	if err := os.WriteFile(*output, []byte(yml), 0o600); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to write %q: %v\n", *output, err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("\nWrote %s (%d tables scanned, %d sensitive columns detected)\n", *output, report.TablesScanned, report.FindingsCount)
+	if len(report.Findings) > 0 {
+		tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+		fmt.Fprintln(tw, "\nTABLE.COLUMN\tRISK\tCOMPLIANCE\tSTRATEGY")
+		fmt.Fprintln(tw, "------------\t----\t----------\t--------")
+		for _, f := range report.Findings {
+			fmt.Fprintf(tw, "%s.%s\t%s\t%s\t%s\n",
+				f.Table, f.Column, f.RiskLevel, strings.ToUpper(strings.Join(f.CompliancePacks, ",")), f.RecommendedStrategy)
+		}
+		_ = tw.Flush()
+	}
+	fmt.Printf("\nNext steps:\n  1. Review %s (override secrets via PGVEIL_UPSTREAM_PASSWORD / PGVEIL_MASKING_SECRET)\n  2. Validate: pgveil validate --config %s\n  3. Run:      pgveil serve --config %s\n", *output, *output, *output)
+}
+
+func formatDisplayURL(addr string) string {
+	return "http://" + formatDisplayHostPort(addr)
+}
+
+func formatDisplayHostPort(addr string) string {
+	if strings.HasPrefix(addr, ":") {
+		return "127.0.0.1" + addr
+	}
+	if strings.HasPrefix(addr, "0.0.0.0:") {
+		return "127.0.0.1:" + strings.TrimPrefix(addr, "0.0.0.0:")
+	}
+	return addr
 }
 
 func runServe(args []string) {
@@ -294,6 +477,18 @@ func runScan(args []string) {
 		out["firewall_decision"] = dec
 		if dec.Action == firewall.ActionBlock {
 			exitCode = 2
+		} else if len(prof.Firewall.RowFilters) > 0 {
+			cfg := mgr.Config()
+			if rlsRes, rerr := firewall.RewriteWithRLS(*sqlQuery, prof, firewall.SessionContext{
+				DBUser:          cfg.Server.UpstreamUser,
+				Database:        cfg.Server.UpstreamDatabase,
+				ApplicationName: prof.Name,
+				RoleProfile:     prof.Name,
+			}); rerr == nil && rlsRes.Rewritten {
+				out["rls_rewritten"] = true
+				out["rewritten_sql"] = rlsRes.SQL
+				out["rls_rules"] = rlsRes.RulesApplied
+			}
 		}
 	}
 	if *sampleText != "" {

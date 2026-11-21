@@ -134,6 +134,16 @@ type sessionMeta struct {
 	txStatus   byte
 	prepStmts  map[string]string
 	stmtFields map[string][]pgwire.FieldDescription
+	stmtRLS    map[string]firewall.RLSResult
+}
+
+func (m *sessionMeta) rlsSession(profileName string) firewall.SessionContext {
+	return firewall.SessionContext{
+		DBUser:          m.dbUser,
+		Database:        m.database,
+		ApplicationName: m.appName,
+		RoleProfile:     profileName,
+	}
 }
 
 type wireMsg struct {
@@ -177,6 +187,7 @@ func (s *Server) handleConnection(ctx context.Context, clientConn net.Conn) {
 		txStatus:   'I',
 		prepStmts:  make(map[string]string),
 		stmtFields: make(map[string][]pgwire.FieldDescription),
+		stmtRLS:    make(map[string]firewall.RLSResult),
 	}
 	if meta.database == "" {
 		meta.database = meta.dbUser
@@ -405,12 +416,32 @@ func (s *Server) handleSimpleQuery(
 		}
 	}
 
-	// Forward approved SQL to upstream PostgreSQL
+	// Apply AST-level Virtual Row-Level Security (RLS) predicate injection strictly AFTER
+	// original-SQL firewall checks and HITL approval have passed.
+	var rlsRes firewall.RLSResult
+	if !profile.IsAuditOnly() && len(profile.Firewall.RowFilters) > 0 {
+		rlsStart := time.Now()
+		var rlsErr error
+		rlsRes, rlsErr = firewall.RewriteWithRLS(sql, profile, meta.rlsSession(profile.Name))
+		proxyOverhead += time.Since(rlsStart)
+		if rlsErr != nil {
+			dec.Rule = "virtual_rls_error"
+			dec.Reason = rlsErr.Error()
+			dec.RiskLevel = "HIGH"
+			s.recordAndEmitBlocked(span, meta, profile, sql, dec, "BLOCKED", proxyOverhead)
+			return s.sendBlockedError(clientW, meta.txStatus, "pgveil virtual RLS rewrite failed: "+rlsErr.Error(), fmt.Sprintf("rule=virtual_rls_error profile=%s", profile.Name), "Verify row_filters policy predicates")
+		}
+		if rlsRes.Rewritten {
+			rawPayload = pgwire.BuildSimpleQuery(rlsRes.SQL)
+		}
+	}
+
+	// Forward approved (and optionally RLS-rewritten) SQL to upstream PostgreSQL
 	upstreamStart := time.Now()
 	if err := pgwire.WriteMessage(upstreamW, pgwire.MsgQuery, rawPayload); err != nil {
 		return err
 	}
-	return s.relayResponseCycle(span, clientW, upstreamR, meta, profile, sql, "", dec, hitlOutcome, proxyOverhead, upstreamStart)
+	return s.relayResponseCycle(span, clientW, upstreamR, meta, profile, sql, "", dec, rlsRes, hitlOutcome, proxyOverhead, upstreamStart)
 }
 
 func (s *Server) handleExtendedBatch(
@@ -487,6 +518,7 @@ func (s *Server) handleExtendedBatch(
 				name := pgwire.ParseSimpleQuery(m.payload[1:])
 				delete(meta.prepStmts, name)
 				delete(meta.stmtFields, name)
+				delete(meta.stmtRLS, name)
 			}
 		}
 	}
@@ -545,10 +577,60 @@ func (s *Server) handleExtendedBatch(
 		}
 	}
 
+	// Apply AST-level Virtual RLS rewriting to every Parse ('P') frame strictly AFTER
+	// original-SQL firewall evaluation and HITL approval have passed.
+	var batchRLS firewall.RLSResult
+	pendingRLS := make(map[string]firewall.RLSResult)
+	if !profile.IsAuditOnly() && len(profile.Firewall.RowFilters) > 0 {
+		sessCtx := meta.rlsSession(profile.Name)
+		for i := range batch {
+			if batch[i].msgType != pgwire.MsgParse {
+				continue
+			}
+			stmtName, query, err := pgwire.ParseParseMessage(batch[i].payload)
+			if err != nil {
+				continue
+			}
+			t0 := time.Now()
+			rlsRes, rlsErr := firewall.RewriteWithRLS(query, profile, sessCtx)
+			proxyOverhead += time.Since(t0)
+			if rlsErr != nil {
+				primaryDec.Rule = "virtual_rls_error"
+				primaryDec.Reason = rlsErr.Error()
+				primaryDec.RiskLevel = "HIGH"
+				s.recordAndEmitBlocked(span, meta, profile, query, primaryDec, "BLOCKED", proxyOverhead)
+				return s.sendBlockedError(clientW, meta.txStatus, "pgveil virtual RLS rewrite failed: "+rlsErr.Error(), fmt.Sprintf("rule=virtual_rls_error profile=%s", profile.Name), "Verify row_filters policy predicates")
+			}
+			if rlsRes.Rewritten {
+				rewrittenPayload, perr := pgwire.RewriteParseMessage(batch[i].payload, rlsRes.SQL)
+				if perr != nil {
+					primaryDec.Rule = "virtual_rls_error"
+					primaryDec.Reason = perr.Error()
+					primaryDec.RiskLevel = "HIGH"
+					s.recordAndEmitBlocked(span, meta, profile, query, primaryDec, "BLOCKED", proxyOverhead)
+					return s.sendBlockedError(clientW, meta.txStatus, "pgveil virtual RLS frame rewrite failed: "+perr.Error(), fmt.Sprintf("rule=virtual_rls_error profile=%s", profile.Name), "Verify Parse wire framing")
+				}
+				batch[i].payload = rewrittenPayload
+				pendingRLS[stmtName] = rlsRes
+				batchRLS = rlsRes
+			}
+		}
+	}
+
 	// Only cache parsed statements in session metadata AFTER every statement in the batch passed policy!
 	for _, ps := range pendingStmts {
 		meta.prepStmts[ps.name] = ps.query
 		delete(meta.stmtFields, ps.name)
+		if r, ok := pendingRLS[ps.name]; ok {
+			meta.stmtRLS[ps.name] = r
+		} else {
+			delete(meta.stmtRLS, ps.name)
+		}
+	}
+	if !batchRLS.Rewritten && activeStmtName != "" {
+		if cached, ok := meta.stmtRLS[activeStmtName]; ok {
+			batchRLS = cached
+		}
 	}
 
 	upstreamStart := time.Now()
@@ -564,7 +646,7 @@ func (s *Server) handleExtendedBatch(
 	if !hasQuery {
 		primaryDec = firewall.Decision{Action: firewall.ActionAllow, StatementType: "EXTENDED", RiskLevel: "LOW", Rule: "policy_allow"}
 	}
-	return s.relayResponseCycle(span, clientW, upstreamR, meta, profile, primarySQL, activeStmtName, primaryDec, hitlOutcome, proxyOverhead, upstreamStart)
+	return s.relayResponseCycle(span, clientW, upstreamR, meta, profile, primarySQL, activeStmtName, primaryDec, batchRLS, hitlOutcome, proxyOverhead, upstreamStart)
 }
 
 func (s *Server) relayUntilFlush(clientW io.Writer, upstreamR io.Reader, meta *sessionMeta, stmtName string, batch []wireMsg) error {
@@ -632,6 +714,7 @@ func (s *Server) relayResponseCycle(
 	sql string,
 	stmtName string,
 	dec firewall.Decision,
+	rlsRes firewall.RLSResult,
 	hitlOutcome string,
 	proxyOverhead time.Duration,
 	upstreamStart time.Time,
@@ -824,7 +907,7 @@ func (s *Server) relayResponseCycle(
 				finalDecision = "MASKED"
 			}
 
-			s.emitTelemetryAndAudit(span, meta, profile, sql, dec, finalDecision, policyReason,
+			s.emitTelemetryAndAudit(span, meta, profile, sql, dec, rlsRes, finalDecision, policyReason,
 				rowsReturned, rowsDropped, rowsTruncated, piiFieldsMasked, piiEntityCounts,
 				proxyOverhead, upstreamDur)
 
@@ -1037,6 +1120,7 @@ func (s *Server) emitTelemetryAndAudit(
 	profile *policy.RoleProfile,
 	sql string,
 	dec firewall.Decision,
+	rlsRes firewall.RLSResult,
 	finalDecision string,
 	policyReason string,
 	rowsReturned int,
@@ -1072,32 +1156,40 @@ func (s *Server) emitTelemetryAndAudit(
 			attribute.String("pgveil.decision", finalDecision),
 			attribute.Int("pgveil.rows_returned", rowsReturned),
 			attribute.Int("pgveil.pii_fields_masked", piiFieldsMasked),
+			attribute.Bool("pgveil.rls_rewritten", rlsRes.Rewritten),
 			attribute.Int64("pgveil.proxy_overhead_us", proxyOverhead.Microseconds()),
 		)
 	}
 
 	if s.eventBus != nil {
+		rewrittenPreview := ""
+		if rlsRes.Rewritten {
+			rewrittenPreview = strings.TrimSpace(rlsRes.SQL)
+		}
 		s.eventBus.Publish(events.AuditEvent{
-			TraceID:            traceID,
-			ClientAddr:         meta.clientAddr,
-			DBUser:             meta.dbUser,
-			DatabaseName:       meta.database,
-			ApplicationName:    meta.appName,
-			RoleProfile:        profile.Name,
-			StatementType:      dec.StatementType,
-			SQLFingerprint:     dec.Fingerprint,
-			RawSQLPreview:      strings.TrimSpace(sql),
-			Decision:           finalDecision,
-			RiskLevel:          dec.RiskLevel,
-			PolicyRule:         dec.Rule,
-			PolicyReason:       policyReason,
-			TablesAccessed:     dec.Tables,
-			RowsReturned:       rowsReturned,
-			RowsTruncated:      rowsTruncated,
-			PIIFieldsMasked:    piiFieldsMasked,
-			PIIEntities:        piiEntities,
-			ProxyOverheadUs:    proxyOverhead.Microseconds(),
-			UpstreamDurationUs: upstreamDur.Microseconds(),
+			TraceID:             traceID,
+			ClientAddr:          meta.clientAddr,
+			DBUser:              meta.dbUser,
+			DatabaseName:        meta.database,
+			ApplicationName:     meta.appName,
+			RoleProfile:         profile.Name,
+			StatementType:       dec.StatementType,
+			SQLFingerprint:      dec.Fingerprint,
+			RawSQLPreview:       strings.TrimSpace(sql),
+			RLSRewritten:        rlsRes.Rewritten,
+			RLSRulesApplied:     rlsRes.RulesApplied,
+			RewrittenSQLPreview: rewrittenPreview,
+			Decision:            finalDecision,
+			RiskLevel:           dec.RiskLevel,
+			PolicyRule:          dec.Rule,
+			PolicyReason:        policyReason,
+			TablesAccessed:      dec.Tables,
+			RowsReturned:        rowsReturned,
+			RowsTruncated:       rowsTruncated,
+			PIIFieldsMasked:     piiFieldsMasked,
+			PIIEntities:         piiEntities,
+			ProxyOverheadUs:     proxyOverhead.Microseconds(),
+			UpstreamDurationUs:  upstreamDur.Microseconds(),
 		})
 	}
 }

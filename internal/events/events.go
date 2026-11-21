@@ -25,9 +25,12 @@ type AuditEvent struct {
 	ApplicationName    string         `json:"application_name,omitempty"`
 	RoleProfile        string         `json:"role_profile"`
 	StatementType      string         `json:"statement_type"`
-	SQLFingerprint     string         `json:"sql_fingerprint"`
-	RawSQLPreview      string         `json:"raw_sql_preview"`
-	Decision           string         `json:"decision"` // ALLOW, MASKED, BLOCKED, TRUNCATED, HITL_APPROVED, HITL_DENIED, HITL_EXPIRED
+	SQLFingerprint      string         `json:"sql_fingerprint"`
+	RawSQLPreview       string         `json:"raw_sql_preview"`
+	RLSRewritten        bool           `json:"rls_rewritten,omitempty"`
+	RLSRulesApplied     []string       `json:"rls_rules_applied,omitempty"`
+	RewrittenSQLPreview string         `json:"rewritten_sql_preview,omitempty"`
+	Decision            string         `json:"decision"` // ALLOW, MASKED, BLOCKED, TRUNCATED, HITL_APPROVED, HITL_DENIED, HITL_EXPIRED
 	RiskLevel          string         `json:"risk_level"`
 	PolicyRule         string         `json:"policy_rule"`
 	PolicyReason       string         `json:"policy_reason,omitempty"`
@@ -138,6 +141,9 @@ func (b *Bus) Publish(ev AuditEvent) {
 	}
 	if r := []rune(ev.RawSQLPreview); len(r) > 500 {
 		ev.RawSQLPreview = string(r[:500]) + "..."
+	}
+	if r := []rune(ev.RewrittenSQLPreview); len(r) > 500 {
+		ev.RewrittenSQLPreview = string(r[:500]) + "..."
 	}
 
 	b.mu.Lock()

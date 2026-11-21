@@ -4,7 +4,7 @@
 
 <p align="center">
   <a href="https://github.com/duhanguler/pgveil/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/duhanguler/pgveil/ci.yml?branch=main&style=flat-square&label=CI" alt="CI" /></a>
-  <a href="https://github.com/duhanguler/pgveil/releases"><img src="https://img.shields.io/badge/Release-v0.3.2-18181b?style=flat-square" alt="v0.3.2" /></a>
+  <a href="https://github.com/duhanguler/pgveil/releases"><img src="https://img.shields.io/badge/Release-v0.4.0-18181b?style=flat-square" alt="v0.4.0" /></a>
   <a href="https://github.com/duhanguler/homebrew-tap"><img src="https://img.shields.io/badge/Homebrew-duhanguler%2Ftap%2Fpgveil-18181b?style=flat-square&logo=homebrew&logoColor=white" alt="Homebrew Tap" /></a>
   <img src="https://img.shields.io/badge/Go-1.26%2B-00ADD8?style=flat-square&logo=go&logoColor=white" alt="Go 1.26+" />
   <img src="https://img.shields.io/badge/PostgreSQL-14--17%20Wire%20v3-336791?style=flat-square&logo=postgresql&logoColor=white" alt="PostgreSQL Wire v3" />
@@ -14,16 +14,16 @@
 
 # pgveil
 
-**Zero-trust PostgreSQL Wire Protocol v3 proxy & native MCP server in Go** — dynamic wire-speed PII masking (**8 compliance packs: GDPR, KVKK, PCI-DSS, HIPAA, LGPD, PIPEDA, UK-GDPR, Secrets**), real **PostgreSQL 17 AST SQL firewall**, **AST side-channel PII oracle protection**, **automatic live schema PII discovery**, **synchronous Human-in-the-Loop (HITL) wire holds**, **runaway AI-agent loop circuit breaker**, **shadow audit-only rollout mode**, async **Kafka audit streaming**, **OpenTelemetry/Prometheus observability**, an embedded **Precision Database Workbench (`67 KB` gzip, Dark + Light theme)**, and a production **Kubernetes Helm chart**.
+**Zero-trust PostgreSQL Wire Protocol v3 proxy, AST Virtual RLS rewriter & native MCP server in Go** — dynamic wire-speed PII masking (**8 compliance packs: GDPR, KVKK, PCI-DSS, HIPAA, LGPD, PIPEDA, UK-GDPR, Secrets**), real **PostgreSQL 17 AST SQL firewall**, **AST-level Virtual Row-Level Security (tenant predicate injection)**, **multi-hop CTE taint & PII side-channel oracle guard**, **automatic live schema PII discovery & `pgveil init` wizard**, **synchronous Human-in-the-Loop (HITL) wire holds**, **runaway AI-agent loop circuit breaker**, **shadow audit-only rollout mode**, async **Kafka audit streaming**, **OpenTelemetry/Prometheus observability**, an embedded **Precision Database Workbench (`68 KB` gzip, Dark + Light theme)**, and a production **Kubernetes Helm chart**.
 
 Give **AI agents (Claude Code, Cursor, MCP, LangChain)**, BI tools (**Metabase, Superset, DBeaver**), and developers live access to PostgreSQL — **with zero database extensions, zero schema changes, and a 1-line port swap (`5432` → `6432`) or zero-Node.js native `pgveil mcp`**.
 
 ```bash
-# Install on macOS (Apple Silicon / Intel) or Linux via Homebrew
-brew install duhanguler/tap/pgveil
+# Try it live in 3 seconds — zero Docker, zero external PostgreSQL required!
+brew install duhanguler/tap/pgveil && pgveil demo
 
-# Audit any live PostgreSQL database for exposed PII columns in 2 seconds
-pgveil discover --dsn "postgres://user:pass@localhost:5432/mydb"
+# Or scan your own PostgreSQL database and generate a validated pgveil.yaml automatically
+pgveil init --dsn "postgres://user:pass@localhost:5432/mydb"
 ```
 
 ```diff
@@ -64,16 +64,54 @@ In 2026, teams are connecting autonomous AI SQL agents, coding assistants (Claud
 | Zero PostgreSQL extensions / RDS, Cloud SQL, Neon, Supabase TLS | **Yes** | No (superuser ext) | **Yes** | **Yes** | **Yes** |
 | Works for **every** client (`psql`, `pgx`, `psycopg`, DBeaver, MCP) | **Yes** | **Yes** | **Yes** | Offline dumps only | MCP only |
 | Real PostgreSQL 17 AST firewall (CTEs, tautologies, multi-stmt) | **Yes** | No | No | No | Regex only |
-| **AST PII Side-Channel Oracle Guard** (`WHERE tckn LIKE`, `SUBSTRING`, `ORDER BY`) | **Yes** | No | No | No | No |
+| **AST Virtual Row-Level Security (RLS)** (tenant predicate injection via `Deparse`) | **Yes** | No | No | No | No |
+| **AST PII Side-Channel Oracle & CTE Taint Guard** (`WHERE tckn LIKE`, `c::text`, `ORDER BY 2`) | **Yes** | No | No | No | No |
 | Live wire-speed PII & secret masking (`DataRow` rewriting + binary `pgx`) | **Yes** (`+0.25ms`) | Views/static | No | Static dump | Post-fetch only |
-| Automatic live schema PII discovery & policy generator (`pgveil discover`) | **Yes** | No | No | No | No |
+| Zero-config sandbox (`pgveil demo`) & live schema onboarding (`pgveil init`) | **Yes** | No | No | No | No |
 | Native zero-Node.js MCP stdio server (`pgveil mcp`) | **Yes** | No | No | No | Node/Python only |
 | **Live synchronous HITL approval hold** + Shadow `audit` mode + Loop breaker | **Yes** | No | No | No | No |
 | Async Kafka audit stream + OTel + Prometheus + Grafana + Helm | **Yes** | No | Metrics only | No | No |
 
 ---
 
-## Automatic Live Schema PII Discovery (`pgveil discover`)
+## AST-Level Virtual Row-Level Security (RLS)
+
+Enforce **multi-tenant and regional row isolation at the PostgreSQL wire layer** without creating database RLS policies, views, or touching application SQL. `pgveil` parses each approved query into PostgreSQL 17's C AST (`libpg_query`), qualifies table aliases, places `LEFT JOIN` predicates cleanly into `ON` clauses (and wraps `FULL OUTER JOIN` tables as subqueries), preserves Extended Query `$1`/`$2` parameters, escapes session placeholders (`{{db_user}}`, `{{database}}`, `{{application_name}}`), and deparses canonical PostgreSQL SQL via `pg_query.Deparse`:
+
+```yaml
+profiles:
+  - name: "tenant_tr"
+    firewall:
+      row_filters:
+        - table: "customers"
+          predicate: "city = 'Istanbul'"
+        - table: "orders"
+          predicate: "currency = 'TRY'"
+        # Dynamic session binding (SQLi-safe quote-escaped):
+        # - table: "invoices"
+        #   predicate: "owner = '{{db_user}}'"
+```
+
+```sql
+-- Client sends:
+SELECT c.id, c.full_name, c.city, o.order_number, o.currency
+FROM customers c LEFT JOIN orders o ON c.id = o.customer_id;
+
+-- pgveil rewrites on the wire (Simple Query, Extended Parse $1, and MCP):
+SELECT c.id, c.full_name, c.city, o.order_number, o.currency
+FROM customers c LEFT JOIN orders o ON c.id = o.customer_id AND o.currency = 'TRY'
+WHERE c.city = 'Istanbul';
+```
+
+> **Security Ordering Invariant:** Firewall guards (`block_write_without_where`, tautology checks, PII side-channel taint) always run on the **original** client AST *before* Virtual RLS injects predicates — so an unscoped `DELETE FROM orders` is always blocked instead of silently wiping a tenant's rows.
+
+<p align="center">
+  <img src="docs/assets/console-rls.png" alt="pgveil AST Virtual Row-Level Security Live Rewrite & Masking Workbench" width="100%" />
+</p>
+
+---
+
+## Automatic Live Schema PII Discovery (`pgveil discover` & `pgveil init`)
 
 Point `pgveil discover` at any existing PostgreSQL database to audit unmasked sensitive columns across **8 checksum-validated compliance packs** and emit a ready-to-use `pgveil.yaml` policy block in seconds:
 
@@ -228,19 +266,23 @@ All benchmarks below were executed locally on **Apple M3 Pro (arm64)** against *
 
 ## Quick Start
 
-### Option 1 — Homebrew (macOS Apple Silicon, Intel & Linux)
+### Option 1 — Instant Zero-Config Demo & Onboarding (Homebrew — macOS & Linux)
 
 ```bash
 brew install duhanguler/tap/pgveil
 
-# 1. Scan any existing PostgreSQL database for exposed PII columns & generate policy YAML
-pgveil discover --dsn "postgres://user:pass@localhost:5432/mydb"
+# 1. Launch the embedded in-memory PostgreSQL sandbox + Precision Workbench (:8088) + Wire Proxy (:6432)
+#    Zero Docker, zero external PostgreSQL, zero config files needed!
+pgveil demo
 
-# 2. Start the wire proxy (:6432) + embedded Workbench UI (:8088)
-pgveil serve --config configs/pgveil.yaml
+# 2. Ready for your own database? Auto-scan & generate a validated pgveil.yaml in 2 seconds
+pgveil init --dsn "postgres://user:pass@localhost:5432/mydb" --output pgveil.yaml
 
-# 3. Or run the zero-Node.js native MCP stdio server for Claude Desktop / Cursor
-pgveil mcp --config configs/pgveil.yaml --profile ai_agent
+# 3. Start the production wire proxy (:6432) + Workbench UI (:8088)
+pgveil serve --config pgveil.yaml
+
+# 4. Or run the zero-Node.js native MCP stdio server for Claude Desktop / Cursor
+pgveil mcp --config pgveil.yaml --profile ai_agent
 ```
 
 ### Option 2 — Full Enterprise Stack in 1 Command (Docker Compose)
@@ -257,22 +299,25 @@ docker compose up --build
 - **Grafana Dashboard:** `http://localhost:3000` (`admin` / `pgveil_grafana`)
 - **Jaeger Distributed Traces:** `http://localhost:16686`
 
-### Option 3 — Build From Source & CLI (`serve`, `discover`, `mcp`, `scan`, `validate`)
+### Option 3 — Build From Source & CLI (`demo`, `init`, `serve`, `discover`, `mcp`, `scan`, `validate`)
 
 ```bash
 make build
 
+# Run instant zero-config sandbox (no external PostgreSQL needed!)
+./bin/pgveil demo
+
+# Scan any live PostgreSQL DB and synthesize a complete validated pgveil.yaml
+./bin/pgveil init --dsn "postgres://user:pass@localhost:5432/mydb" --output pgveil.yaml
+
 # Start wire proxy + embedded Web Console
 ./bin/pgveil serve --config configs/pgveil.yaml
 
-# Auto-discover unmasked PII columns & generate a pgveil.yaml policy block
-./bin/pgveil discover --dsn "postgres://user:pass@localhost:5432/mydb" --format yaml
-
-# Run zero-Node.js native MCP stdio server (hides denied_tables, enforces AST + PII masking)
+# Run zero-Node.js native MCP stdio server (hides denied_tables, enforces AST + Virtual RLS + PII masking)
 ./bin/pgveil mcp --config configs/pgveil.yaml --profile ai_agent
 
-# Test any SQL query against the AST firewall in CI (exits 2 if BLOCKED)
-./bin/pgveil scan --sql "SELECT id FROM customers WHERE tckn LIKE '100000%'" --profile ai_agent
+# Test any SQL query against the AST firewall & Virtual RLS rewriter in CI (exits 2 if BLOCKED)
+./bin/pgveil scan --sql "SELECT c.id, o.order_number FROM customers c LEFT JOIN orders o ON c.id = o.customer_id" --profile tenant_tr
 ```
 
 ### Option 4 — Connect Claude Desktop / Cursor MCP (Zero Node.js or Wire Mode)
@@ -318,24 +363,25 @@ helm upgrade --install pgveil deploy/helm/pgveil \
 ```text
 pgveil/
 ├── cmd/
-│   ├── pgveil/              # Single-binary CLI (serve, discover, mcp, scan, validate) + embedded UI
+│   ├── pgveil/              # Single-binary CLI (demo, init, serve, discover, mcp, scan, validate) + embedded UI
 │   └── audit-worker/        # Kafka consumer group worker (batch pgx sink, DLQ, burst anomaly alerts)
 ├── internal/
-│   ├── pgwire/              # PostgreSQL Wire Protocol v3 binary framing (Simple & Extended)
-│   ├── firewall/            # PostgreSQL 17 C AST SQL firewall + PII side-channel oracle guard
+│   ├── pgwire/              # PostgreSQL Wire Protocol v3 binary framing (Simple & Extended + Parse rewrite)
+│   ├── firewall/            # PostgreSQL 17 C AST SQL firewall, CTE taint guard & Virtual RLS rewriter
+│   ├── demo/                # Pure-Go AST-backed in-memory PostgreSQL Wire v3 sandbox (`pgveil demo`)
 │   ├── pii/                 # Zero-false-positive 8-pack compliance engine (GDPR/KVKK/PCI/HIPAA/LGPD/PIPEDA/UK/Secrets)
-│   ├── discover/            # Live information_schema PII scanner & YAML policy synthesizer
-│   ├── mcpserver/           # Native zero-dependency JSON-RPC 2.0 MCP stdio server
+│   ├── discover/            # Live information_schema PII scanner & `pgveil init` starter-config generator
+│   ├── mcpserver/           # Native zero-dependency JSON-RPC 2.0 MCP stdio server (with Virtual RLS)
 │   ├── ratelimit/           # Per-profile QPM limiter & runaway AI-agent loop circuit breaker
-│   ├── proxy/               # Bidirectional wire proxy, upstream TLS, shadow audit mode & live HITL holds
+│   ├── proxy/               # Bidirectional wire proxy, upstream TLS, Virtual RLS, shadow audit & live HITL holds
 │   ├── hitl/                # Synchronous approval coordinator with SSE live notifications
-│   ├── policy/              # Declarative YAML RBAC profiles + SIGHUP/API hot-reload
+│   ├── policy/              # Declarative YAML RBAC profiles + AST predicate validation + SIGHUP/API hot-reload
 │   ├── events/              # Non-blocking audit ring buffer, SSE hub & franz-go Kafka producer
 │   ├── telemetry/           # OpenTelemetry OTLP tracing + Prometheus histograms/counters
 │   ├── api/                 # Control Plane REST/SSE API, live wire Playground & Discovery endpoint
 │   └── webui/               # //go:embed compiled React + TypeScript Control Plane
 ├── web/                     # React 18 + TypeScript + Vite + Tailwind Console source
-├── configs/pgveil.yaml      # Declarative profiles (ai_agent, analyst, developer, admin)
+├── configs/pgveil.yaml      # Declarative profiles (ai_agent, tenant_tr, analyst, developer, admin)
 ├── deploy/
 │   ├── docker/              # Postgres demo seed, Prometheus config & Grafana dashboard JSON
 │   └── helm/pgveil/         # Production Kubernetes Helm chart (HPA, PDB, NetworkPolicy)

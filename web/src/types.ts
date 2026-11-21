@@ -21,6 +21,9 @@ export interface AuditEvent {
   statement_type: string
   sql_fingerprint: string
   raw_sql_preview: string
+  rls_rewritten?: boolean
+  rls_rules_applied?: string[]
+  rewritten_sql_preview?: string
   decision: string
   risk_level: string
   policy_rule: string
@@ -92,6 +95,7 @@ export interface RoleProfile {
     hitl_mode: string
     hitl_timeout: string
     denied_tables?: string[]
+    row_filters?: { table: string; predicate: string }[]
     max_rows: number
     max_rows_action: string
     rate_limit?: {

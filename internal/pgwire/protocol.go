@@ -242,6 +242,39 @@ func ParseSimpleQuery(payload []byte) string {
 	return string(payload)
 }
 
+// BuildSimpleQuery constructs a NUL-terminated Simple Query ('Q') payload.
+func BuildSimpleQuery(sql string) []byte {
+	out := make([]byte, len(sql)+1)
+	copy(out, sql)
+	return out
+}
+
+// EncodeRowDescription encodes FieldDescriptions into a PostgreSQL RowDescription ('T') payload.
+func EncodeRowDescription(fields []FieldDescription) []byte {
+	var b bytes.Buffer
+	var tmp2 [2]byte
+	var tmp4 [4]byte
+	binary.BigEndian.PutUint16(tmp2[:], uint16(len(fields)))
+	b.Write(tmp2[:])
+	for _, f := range fields {
+		b.WriteString(f.Name)
+		b.WriteByte(0)
+		binary.BigEndian.PutUint32(tmp4[:], f.TableOID)
+		b.Write(tmp4[:])
+		binary.BigEndian.PutUint16(tmp2[:], f.ColumnAttr)
+		b.Write(tmp2[:])
+		binary.BigEndian.PutUint32(tmp4[:], f.DataTypeOID)
+		b.Write(tmp4[:])
+		binary.BigEndian.PutUint16(tmp2[:], uint16(f.DataTypeSize))
+		b.Write(tmp2[:])
+		binary.BigEndian.PutUint32(tmp4[:], uint32(f.TypeModifier))
+		b.Write(tmp4[:])
+		binary.BigEndian.PutUint16(tmp2[:], f.FormatCode)
+		b.Write(tmp2[:])
+	}
+	return b.Bytes()
+}
+
 // ParseParseMessage extracts prepared statement name and SQL query from a Parse ('P') payload.
 func ParseParseMessage(payload []byte) (stmtName string, query string, err error) {
 	n1 := bytes.IndexByte(payload, 0)
@@ -256,6 +289,27 @@ func ParseParseMessage(payload []byte) (stmtName string, query string, err error
 	}
 	query = string(rest[:n2])
 	return stmtName, query, nil
+}
+
+// RewriteParseMessage replaces only the SQL query inside a Parse ('P') payload while preserving
+// the exact prepared statement name and trailing parameter OID array ([count:2][oid:4*N]).
+func RewriteParseMessage(payload []byte, newSQL string) ([]byte, error) {
+	n1 := bytes.IndexByte(payload, 0)
+	if n1 < 0 {
+		return nil, errors.New("invalid Parse message: missing stmt name terminator")
+	}
+	rest := payload[n1+1:]
+	n2 := bytes.IndexByte(rest, 0)
+	if n2 < 0 {
+		return nil, errors.New("invalid Parse message: missing query terminator")
+	}
+	tail := rest[n2+1:] // [numParamOIDs:2][OID:4*N]
+	out := make([]byte, 0, n1+1+len(newSQL)+1+len(tail))
+	out = append(out, payload[:n1+1]...)
+	out = append(out, newSQL...)
+	out = append(out, 0)
+	out = append(out, tail...)
+	return out, nil
 }
 
 // ParseBindInfo parses portal and statement names from a Bind ('B') payload, and optionally

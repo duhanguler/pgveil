@@ -398,6 +398,26 @@ func (s *Server) toolQuery(ctx context.Context, prof *policy.RoleProfile, sqlStr
 		return fmt.Sprintf("THROTTLED by pgveil [%s]: %s", rl.Rule, rl.Reason), true
 	}
 
+	// 3. AST-level Virtual Row-Level Security (RLS) predicate injection
+	execSQL := sqlStr
+	var rlsRes firewall.RLSResult
+	if !prof.IsAuditOnly() && len(prof.Firewall.RowFilters) > 0 {
+		cfg := s.policyMgr.Config()
+		var rlsErr error
+		rlsRes, rlsErr = firewall.RewriteWithRLS(sqlStr, prof, firewall.SessionContext{
+			DBUser:          cfg.Server.UpstreamUser,
+			Database:        cfg.Server.UpstreamDatabase,
+			ApplicationName: "pgveil-mcp",
+			RoleProfile:     prof.Name,
+		})
+		if rlsErr != nil {
+			return fmt.Sprintf("BLOCKED by pgveil Virtual RLS: %v", rlsErr), true
+		}
+		if rlsRes.Rewritten {
+			execSQL = rlsRes.SQL
+		}
+	}
+
 	conn, err := s.dialDB(ctx)
 	if err != nil {
 		return "database connection error: " + err.Error(), true
@@ -407,7 +427,7 @@ func (s *Server) toolQuery(ctx context.Context, prof *policy.RoleProfile, sqlStr
 	qCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 
-	rows, err := conn.Query(qCtx, sqlStr)
+	rows, err := conn.Query(qCtx, execSQL)
 	if err != nil {
 		return "PostgreSQL error: " + err.Error(), true
 	}
@@ -484,13 +504,18 @@ func (s *Server) toolQuery(ctx context.Context, prof *policy.RoleProfile, sqlStr
 		return "PostgreSQL error: " + err.Error(), true
 	}
 
-	payload, _ := json.MarshalIndent(map[string]any{
+	outMap := map[string]any{
 		"profile":          prof.Name,
 		"row_count":        len(result),
 		"truncated":        truncated,
 		"pii_cells_masked": maskedCells,
 		"rows":             result,
-	}, "", "  ")
+	}
+	if rlsRes.Rewritten {
+		outMap["rls_rewritten"] = true
+		outMap["rls_rules_applied"] = rlsRes.RulesApplied
+	}
+	payload, _ := json.MarshalIndent(outMap, "", "  ")
 	return string(payload), false
 }
 

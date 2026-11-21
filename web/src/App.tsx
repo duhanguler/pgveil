@@ -97,7 +97,7 @@ export default function App() {
   // Live backend state
   const [summary, setSummary] = useState<Summary | null>(null)
   const [proxyAddr, setProxyAddr] = useState(':6432')
-  const [version, setVersion] = useState('0.3.2')
+  const [version, setVersion] = useState('0.4.0')
   const [events, setEvents] = useState<AuditEvent[]>([])
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([])
   const [profiles, setProfiles] = useState<RoleProfile[]>([])
@@ -112,6 +112,7 @@ export default function App() {
   const [running, setRunning] = useState(false)
   const [pgResult, setPgResult] = useState<PlaygroundResult | null>(null)
   const [preflight, setPreflight] = useState<FirewallDecision | null>(null)
+  const [preflightRLS, setPreflightRLS] = useState<{ sql: string; rules: string[] } | null>(null)
 
   // Discovery state
   const [discovering, setDiscovering] = useState(false)
@@ -257,6 +258,7 @@ export default function App() {
   useEffect(() => {
     if (!sql.trim()) {
       setPreflight(null)
+      setPreflightRLS(null)
       return
     }
     const timer = window.setTimeout(async () => {
@@ -269,6 +271,11 @@ export default function App() {
         if (res.ok) {
           const d = await res.json()
           setPreflight(d.decision || null)
+          if (d.rls_rewritten && d.rewritten_sql) {
+            setPreflightRLS({ sql: d.rewritten_sql, rules: d.rls_rules || [] })
+          } else {
+            setPreflightRLS(null)
+          }
         }
       } catch {
         // ignore
@@ -635,10 +642,11 @@ with psycopg.connect(DSN) as conn:
             <div className="space-y-1">
               {(profiles.length
                 ? profiles
-                : [{ name: 'ai_agent' }, { name: 'analyst' }, { name: 'developer' }, { name: 'admin' }]
+                : [{ name: 'ai_agent' }, { name: 'tenant_tr' }, { name: 'analyst' }, { name: 'developer' }, { name: 'admin' }]
               ).map((p) => {
                 const active = selectedProfile === p.name
                 const maxRows = 'firewall' in p ? p.firewall.max_rows : 0
+                const rlsCount = 'firewall' in p ? p.firewall.row_filters?.length || 0 : 0
                 return (
                   <button
                     key={p.name}
@@ -649,14 +657,22 @@ with psycopg.connect(DSN) as conn:
                       color: active ? 'var(--ink-1)' : 'var(--ink-2)'
                     }}
                   >
-                    <span className="flex items-center gap-2">
+                    <span className="flex items-center gap-2 min-w-0">
                       <span
-                        className="w-1.5 h-1.5 rounded-full"
+                        className="w-1.5 h-1.5 rounded-full shrink-0"
                         style={{ background: active ? 'var(--ok)' : 'var(--border-strong)' }}
                       />
-                      <span>{p.name}</span>
+                      <span className="truncate">{p.name}</span>
+                      {rlsCount > 0 && (
+                        <span
+                          className="text-[9px] px-1 py-0 rounded border shrink-0"
+                          style={{ borderColor: 'var(--border)', color: 'var(--info)', background: 'var(--bg-surface)' }}
+                        >
+                          RLS
+                        </span>
+                      )}
                     </span>
-                    <span className="text-[10px]" style={{ color: 'var(--ink-3)' }}>
+                    <span className="text-[10px] shrink-0" style={{ color: 'var(--ink-3)' }}>
                       {maxRows > 0 ? `≤${maxRows}` : '∞'}
                     </span>
                   </button>
@@ -670,7 +686,13 @@ with psycopg.connect(DSN) as conn:
               >
                 <span>{activeProfileObj.masking.enabled ? `${activeProfileObj.masking.compliance_packs?.length || 0} packs` : 'unmasked'}</span>
                 <span style={{ color: 'var(--border-strong)' }}>·</span>
-                <span>{activeProfileObj.firewall.block_pii_inference ? 'oracle guard' : 'standard'}</span>
+                <span>
+                  {activeProfileObj.firewall.row_filters?.length
+                    ? `${activeProfileObj.firewall.row_filters.length} RLS rules`
+                    : activeProfileObj.firewall.block_pii_inference
+                    ? 'oracle guard'
+                    : 'standard'}
+                </span>
               </div>
             )}
           </div>
@@ -798,6 +820,17 @@ with psycopg.connect(DSN) as conn:
                           <span>tables: {preflight.tables.join(', ')}</span>
                         </>
                       )}
+                      {preflightRLS && (
+                        <>
+                          <span style={{ color: 'var(--border-strong)' }}>·</span>
+                          <span
+                            className="px-1.5 py-0.2 rounded border text-[10.5px]"
+                            style={{ borderColor: 'var(--border-strong)', background: 'var(--bg-panel)', color: 'var(--info)' }}
+                          >
+                            RLS: +{preflightRLS.rules.length} {preflightRLS.rules.length === 1 ? 'filter' : 'filters'}
+                          </span>
+                        </>
+                      )}
                     </>
                   )}
                 </div>
@@ -820,6 +853,22 @@ with psycopg.connect(DSN) as conn:
                   )}
                 </div>
               </div>
+
+              {/* Live Virtual RLS Rewritten SQL Preview Strip */}
+              {preflightRLS && (
+                <div
+                  className="shrink-0 border-b px-3.5 py-1.5 flex items-baseline gap-2.5 text-[11px] font-mono"
+                  style={{ background: 'var(--bg-panel)', borderColor: 'var(--border)' }}
+                >
+                  <span className="shrink-0 inline-flex items-center gap-1.5 font-medium" style={{ color: 'var(--info)' }}>
+                    <span className="w-1.5 h-1.5 rounded-full" style={{ background: 'var(--info)' }} />
+                    Virtual RLS →
+                  </span>
+                  <code className="whitespace-pre-wrap break-words leading-relaxed" style={{ color: 'var(--ink-1)' }}>
+                    {preflightRLS.sql}
+                  </code>
+                </div>
+              )}
 
               {/* Live Synchronous HITL Wire Hold Bar */}
               {pendingApprovals.length > 0 && (
@@ -934,13 +983,31 @@ with psycopg.connect(DSN) as conn:
 
                 {pgResult && pgResult.status === 'ok' && (
                   <div className="flex-1 flex flex-col min-h-0">
-                    {/* Sub-header: Wire Notices & Masked Entity Breakdown */}
-                    {(pgResult.notices?.length || (pgResult.audit && pgResult.audit.pii_fields_masked > 0)) ? (
+                    {/* Sub-header: Wire Notices, Virtual RLS & Masked Entity Breakdown */}
+                    {(pgResult.notices?.length ||
+                      (pgResult.audit && (pgResult.audit.pii_fields_masked > 0 || pgResult.audit.rls_rewritten))) ? (
                       <div
                         className="shrink-0 border-b px-3.5 py-1.5 flex items-center justify-between gap-3 flex-wrap text-[11px] font-mono"
                         style={{ background: 'var(--bg-panel)', borderColor: 'var(--border)' }}
                       >
                         <div className="flex items-center gap-2 flex-wrap">
+                          {pgResult.audit && pgResult.audit.rls_rewritten && (
+                            <>
+                              <span className="flex items-center gap-1.5" style={{ color: 'var(--info)' }}>
+                                <span className="w-1.5 h-1.5 rounded-full" style={{ background: 'var(--info)' }} />
+                                Virtual RLS:
+                              </span>
+                              {(pgResult.audit.rls_rules_applied || []).map((rule) => (
+                                <span
+                                  key={rule}
+                                  className="px-1.5 py-0.2 rounded border"
+                                  style={{ borderColor: 'var(--border)', background: 'var(--bg-surface)', color: 'var(--ink-2)' }}
+                                >
+                                  {rule}
+                                </span>
+                              ))}
+                            </>
+                          )}
                           {pgResult.audit && pgResult.audit.pii_fields_masked > 0 && (
                             <>
                               <span className="flex items-center gap-1.5" style={{ color: 'var(--ok)' }}>
@@ -1424,6 +1491,14 @@ with psycopg.connect(DSN) as conn:
                                 {ev.statement_type}
                               </td>
                               <td className="px-3 py-1.5 max-w-md truncate" style={{ color: 'var(--ink-1)' }}>
+                                {ev.rls_rewritten && (
+                                  <span
+                                    className="mr-1.5 px-1 py-0 rounded border text-[9.5px]"
+                                    style={{ borderColor: 'var(--border)', color: 'var(--info)', background: 'var(--bg-surface)' }}
+                                  >
+                                    RLS
+                                  </span>
+                                )}
                                 {ev.raw_sql_preview}
                               </td>
                               <td className="px-3 py-1.5 text-right" style={{ color: 'var(--ink-2)' }}>
@@ -1458,9 +1533,50 @@ with psycopg.connect(DSN) as conn:
                     </button>
                   </div>
                   <div className="p-3.5 space-y-4 text-xs font-mono">
-                    <div className="rounded border overflow-hidden" style={{ borderColor: 'var(--border)' }}>
-                      <CodeEditor value={inspectedEvent.raw_sql_preview} language="sql" readOnly minRows={3} maxHeightClass="max-h-40" />
+                    <div className="space-y-1.5">
+                      {inspectedEvent.rls_rewritten && (
+                        <div className="text-[10px] uppercase" style={{ color: 'var(--ink-3)' }}>
+                          Original SQL
+                        </div>
+                      )}
+                      <div className="rounded border overflow-hidden" style={{ borderColor: 'var(--border)' }}>
+                        <CodeEditor value={inspectedEvent.raw_sql_preview} language="sql" readOnly minRows={3} maxHeightClass="max-h-40" />
+                      </div>
                     </div>
+                    {inspectedEvent.rls_rewritten && inspectedEvent.rewritten_sql_preview && (
+                      <div className="space-y-1.5">
+                        <div className="flex items-center justify-between text-[10px] uppercase">
+                          <span style={{ color: 'var(--info)' }}>Rewritten SQL (Virtual RLS)</span>
+                          <span style={{ color: 'var(--ink-3)' }}>
+                            {(inspectedEvent.rls_rules_applied || []).length}{' '}
+                            {(inspectedEvent.rls_rules_applied || []).length === 1 ? 'filter' : 'filters'}
+                          </span>
+                        </div>
+                        <pre
+                          className="rounded border p-2.5 text-[11.5px] leading-relaxed whitespace-pre-wrap break-words max-h-44 overflow-y-auto"
+                          style={{
+                            borderColor: 'var(--border-strong)',
+                            background: 'var(--bg-canvas)',
+                            color: 'var(--ink-1)'
+                          }}
+                        >
+                          {inspectedEvent.rewritten_sql_preview}
+                        </pre>
+                        {inspectedEvent.rls_rules_applied && inspectedEvent.rls_rules_applied.length > 0 && (
+                          <div className="flex flex-wrap gap-1 pt-0.5">
+                            {inspectedEvent.rls_rules_applied.map((r) => (
+                              <span
+                                key={r}
+                                className="px-1.5 py-0.5 rounded border text-[10.5px]"
+                                style={{ borderColor: 'var(--border)', background: 'var(--bg-surface)', color: 'var(--ink-2)' }}
+                              >
+                                {r}
+                              </span>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
                     <dl className="grid grid-cols-2 gap-y-3 gap-x-4 text-[11.5px]">
                       <DetailKV label="Decision" value={inspectedEvent.decision} />
                       <DetailKV label="Profile" value={inspectedEvent.role_profile} />

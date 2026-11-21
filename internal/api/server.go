@@ -261,17 +261,35 @@ func (s *Server) handleInspect(w http.ResponseWriter, r *http.Request) {
 		prof = s.policyMgr.MatchProfile("", req.Profile)
 	}
 	dec := firewall.Evaluate(req.SQL, prof)
+	cfg := s.policyMgr.Config()
+	var rlsRes firewall.RLSResult
+	if dec.Action != firewall.ActionBlock && len(prof.Firewall.RowFilters) > 0 {
+		if res, rerr := firewall.RewriteWithRLS(req.SQL, prof, firewall.SessionContext{
+			DBUser:          cfg.Server.UpstreamUser,
+			Database:        cfg.Server.UpstreamDatabase,
+			ApplicationName: prof.Name,
+			RoleProfile:     prof.Name,
+		}); rerr == nil {
+			rlsRes = res
+		}
+	}
 	var maskedSample string
 	var entities map[string]int
 	if req.Sample != "" {
 		maskedSample, entities = s.policyMgr.Masker().MaskText(req.Sample, prof.EnabledEntities())
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	resp := map[string]any{
 		"profile":       prof.Name,
 		"decision":      dec,
 		"masked_sample": maskedSample,
 		"entities":      entities,
-	})
+	}
+	if rlsRes.Rewritten {
+		resp["rls_rewritten"] = true
+		resp["rewritten_sql"] = rlsRes.SQL
+		resp["rls_rules"] = rlsRes.RulesApplied
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // handlePlaygroundQuery executes a live PostgreSQL query THROUGH pgveil's real wire proxy (:6432)

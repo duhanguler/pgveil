@@ -25,6 +25,14 @@ export const QUERY_PRESETS: QueryPreset[] = [
     hint: 'Scans unstructured text cells for embedded TCKNs, IBANs, Luhn credit cards, SSNs, and AWS keys.'
   },
   {
+    id: 'rls_tenant_join',
+    label: 'Virtual RLS JOIN (Switch role → tenant_tr)',
+    shortLabel: 'RLS Tenant JOIN',
+    category: 'masking',
+    sql: 'SELECT c.id, c.full_name, c.city, o.order_number, o.total_amount, o.currency\nFROM customers c\nJOIN orders o ON c.id = o.customer_id\nORDER BY o.id;',
+    hint: 'Select tenant_tr in the left sidebar to see AST Virtual RLS auto-inject c.city = Istanbul AND o.currency = TRY.'
+  },
+  {
     id: 'bulk_exfil',
     label: 'Bulk Exfiltration (40 Rows → Cap 25)',
     shortLabel: 'Bulk Cap',

@@ -97,7 +97,7 @@ export default function App() {
   // Live backend state
   const [summary, setSummary] = useState<Summary | null>(null)
   const [proxyAddr, setProxyAddr] = useState(':6432')
-  const [version, setVersion] = useState('0.3.1')
+  const [version, setVersion] = useState('0.3.2')
   const [events, setEvents] = useState<AuditEvent[]>([])
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([])
   const [profiles, setProfiles] = useState<RoleProfile[]>([])

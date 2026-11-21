@@ -87,5 +87,29 @@ export const QUERY_PRESETS: QueryPreset[] = [
     category: 'firewall',
     sql: 'SELECT service_name, secret_value\nFROM api_secrets;',
     hint: 'Enforces table denylist even inside subqueries and CTEs.'
+  },
+  {
+    id: 'cte_taint_leak',
+    label: 'CTE Taint Alias Bypass (WITH leak)',
+    shortLabel: 'CTE Taint',
+    category: 'firewall',
+    sql: "WITH leak AS (\n  SELECT id, tckn AS innocent FROM customers\n)\nSELECT id FROM leak WHERE innocent LIKE '100000%';",
+    hint: 'AST fixed-point taint propagation tracks aliased PII columns across multi-hop CTEs and subqueries.'
+  },
+  {
+    id: 'whole_row_exfil',
+    label: 'Whole-Row Serialization (c::text)',
+    shortLabel: 'Whole-Row Exfil',
+    category: 'firewall',
+    sql: 'SELECT c::text\nFROM customers c\nLIMIT 5;',
+    hint: 'Blocks whole-row composite projection/serialization (c::text, row_to_json(c)) that bypasses column masking.'
+  },
+  {
+    id: 'positional_order_oracle',
+    label: 'Positional Oracle (ORDER BY 2)',
+    shortLabel: 'ORDER BY 2',
+    category: 'firewall',
+    sql: 'SELECT id, tckn\nFROM customers\nORDER BY 2;',
+    hint: 'Blocks binary-search positional ORDER BY / GROUP BY index probes against protected PII columns.'
   }
 ]

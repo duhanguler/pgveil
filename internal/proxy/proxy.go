@@ -610,10 +610,6 @@ func (s *Server) relayResponseCycle(
 			if len(payload) > 0 {
 				meta.txStatus = payload[0]
 			}
-			if err := pgwire.WriteMessage(clientW, mType, payload); err != nil {
-				return err
-			}
-
 			totalElapsed := time.Since(upstreamStart)
 			upstreamDur := totalElapsed - proxyOverhead
 			if upstreamDur < 0 {
@@ -637,6 +633,10 @@ func (s *Server) relayResponseCycle(
 			s.emitTelemetryAndAudit(span, meta, profile, sql, dec, finalDecision, policyReason,
 				rowsReturned, rowsDropped, rowsTruncated, piiFieldsMasked, piiEntityCounts,
 				proxyOverhead, upstreamDur)
+
+			if err := pgwire.WriteMessage(clientW, mType, payload); err != nil {
+				return err
+			}
 			return nil
 
 		default:

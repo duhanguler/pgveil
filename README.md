@@ -4,18 +4,19 @@
 
 <p align="center">
   <a href="https://github.com/duhanguler/pgveil/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/duhanguler/pgveil/ci.yml?branch=main&style=flat-square&label=CI" alt="CI" /></a>
+  <a href="https://github.com/duhanguler/pgveil/releases"><img src="https://img.shields.io/badge/Release-v0.2.0-10b981?style=flat-square" alt="v0.2.0" /></a>
   <img src="https://img.shields.io/badge/Go-1.26%2B-00ADD8?style=flat-square&logo=go&logoColor=white" alt="Go 1.26+" />
   <img src="https://img.shields.io/badge/PostgreSQL-14--17%20Wire%20v3-336791?style=flat-square&logo=postgresql&logoColor=white" alt="PostgreSQL Wire v3" />
   <img src="https://img.shields.io/badge/AST-libpg__query%2017-10b981?style=flat-square" alt="PostgreSQL 17 AST" />
-  <img src="https://img.shields.io/badge/Compliance-GDPR%20%C2%B7%20KVKK%20%C2%B7%20PCI--DSS%20%C2%B7%20HIPAA-0ea5e9?style=flat-square" alt="Compliance Packs" />
+  <img src="https://img.shields.io/badge/Compliance-8%20Global%20Packs-0ea5e9?style=flat-square" alt="8 Compliance Packs" />
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square" alt="Apache 2.0 License" /></a>
 </p>
 
 # pgveil
 
-**Zero-trust PostgreSQL Wire Protocol v3 proxy in Go** — dynamic wire-speed PII masking (**GDPR, KVKK, PCI-DSS, HIPAA, Secrets**), real **PostgreSQL 17 AST SQL firewall**, **synchronous Human-in-the-Loop (HITL) wire holds**, async **Kafka audit streaming**, **OpenTelemetry/Prometheus observability**, an **embedded React Web Console**, and a production **Kubernetes Helm chart**.
+**Zero-trust PostgreSQL Wire Protocol v3 proxy & native MCP server in Go** — dynamic wire-speed PII masking (**8 compliance packs: GDPR, KVKK, PCI-DSS, HIPAA, LGPD, PIPEDA, UK-GDPR, Secrets**), real **PostgreSQL 17 AST SQL firewall**, **AST side-channel PII oracle protection**, **automatic live schema PII discovery**, **synchronous Human-in-the-Loop (HITL) wire holds**, **runaway AI-agent loop circuit breaker**, **shadow audit-only rollout mode**, async **Kafka audit streaming**, **OpenTelemetry/Prometheus observability**, an **embedded React Web Console**, and a production **Kubernetes Helm chart**.
 
-Give **AI agents (Claude Code, Cursor, MCP PostgreSQL servers, LangChain)**, BI tools (**Metabase, Superset, DBeaver**), and developers live access to PostgreSQL — **with zero database extensions, zero schema changes, and a 1-line port swap (`5432` → `6432`)**.
+Give **AI agents (Claude Code, Cursor, MCP, LangChain)**, BI tools (**Metabase, Superset, DBeaver**), and developers live access to PostgreSQL — **with zero database extensions, zero schema changes, and a 1-line port swap (`5432` → `6432`) or zero-Node.js native `pgveil mcp`**.
 
 ```diff
 - postgres://app:secret@db.internal:5432/prod
@@ -32,22 +33,56 @@ Give **AI agents (Claude Code, Cursor, MCP PostgreSQL servers, LangChain)**, BI 
 
 ## Why pgveil?
 
-In 2026, teams are plugging autonomous AI SQL agents, coding assistants (Claude Code, Cursor, MCP servers), and BI analysts directly into PostgreSQL replicas and production databases. One hallucinated `DELETE FROM orders WHERE 1=1`, a prompt-injected `SELECT pg_read_file('/etc/passwd')`, or an innocent `SELECT * FROM customers` dumping 500,000 customer rows into an LLM context window creates an immediate outage or **GDPR / KVKK / PCI-DSS** breach.
+In 2026, teams are connecting autonomous AI SQL agents, coding assistants (Claude Code, Cursor, MCP servers), and BI analysts directly to PostgreSQL replicas and production databases. One hallucinated `DELETE FROM orders WHERE 1=1`, a prompt-injected `SELECT pg_read_file('/etc/passwd')`, a side-channel oracle probe (`WHERE tckn LIKE '100000%'`), or an innocent `SELECT * FROM customers` dumping 500,000 customer rows into an LLM context window creates an immediate outage or **GDPR / KVKK / PCI-DSS / HIPAA** breach.
 
 | Capability | `pgveil` | `postgresql_anonymizer` | `PgBouncer` | `pgdump-obfuscator` | MCP Wrapper Scripts |
 |---|:---:|:---:|:---:|:---:|:---:|
-| Zero PostgreSQL extensions / RDS & Cloud SQL compatible | **Yes** | No (superuser ext) | **Yes** | **Yes** | **Yes** |
+| Zero PostgreSQL extensions / RDS, Cloud SQL, Neon, Supabase TLS | **Yes** | No (superuser ext) | **Yes** | **Yes** | **Yes** |
 | Works for **every** client (`psql`, `pgx`, `psycopg`, DBeaver, MCP) | **Yes** | **Yes** | **Yes** | Offline dumps only | MCP only |
 | Real PostgreSQL 17 AST firewall (CTEs, tautologies, multi-stmt) | **Yes** | No | No | No | Regex only |
-| Live wire-speed PII & secret masking (`DataRow` rewriting) | **Yes** (`+0.25ms`) | Views/static | No | Static dump | Post-fetch only |
-| Checksum-validated PII (**TCKN, TR/EU IBAN, VKN, Luhn CC, SSN**) | **Yes** | Manual rules | No | Manual | No |
-| Row-exfiltration budget + PostgreSQL `NOTICE` truncation | **Yes** | No | No | No | No |
-| **Live synchronous HITL approval hold** on the wire | **Yes** | No | No | No | Rarely |
+| **AST PII Side-Channel Oracle Guard** (`WHERE tckn LIKE`, `SUBSTRING`, `ORDER BY`) | **Yes** | No | No | No | No |
+| Live wire-speed PII & secret masking (`DataRow` rewriting + binary `pgx`) | **Yes** (`+0.25ms`) | Views/static | No | Static dump | Post-fetch only |
+| Automatic live schema PII discovery & policy generator (`pgveil discover`) | **Yes** | No | No | No | No |
+| Native zero-Node.js MCP stdio server (`pgveil mcp`) | **Yes** | No | No | No | Node/Python only |
+| **Live synchronous HITL approval hold** + Shadow `audit` mode + Loop breaker | **Yes** | No | No | No | No |
 | Async Kafka audit stream + OTel + Prometheus + Grafana + Helm | **Yes** | No | Metrics only | No | No |
 
 ---
 
-## See It in Action (Real `psql` Wire Session)
+## Automatic Live Schema PII Discovery (`pgveil discover`)
+
+Point `pgveil discover` at any existing PostgreSQL database to audit unmasked sensitive columns across **8 checksum-validated compliance packs** and emit a ready-to-use `pgveil.yaml` policy block in seconds:
+
+```bash
+pgveil discover --dsn "postgres://pgveil:pgveil_dev_password@127.0.0.1:5432/pgveil_demo?sslmode=disable"
+```
+
+```text
+pgveil Schema PII Discovery — database="pgveil_demo" tables=5 columns=38 findings=12
+
+TABLE.COLUMN              RISK      COMPLIANCE                       STRATEGY  SAMPLE MASKED
+------------              ----      ----------                       --------  -------------
+api_secrets.secret_value  CRITICAL  SECRETS                          redact    [REDACTED:GITHUB_TOKEN]
+customers.full_name       MEDIUM    GDPR,KVKK                        hash      [heuristic match]
+customers.email           HIGH      GDPR,KVKK                        partial   a***@example.com.tr
+customers.phone           MEDIUM    GDPR,KVKK                        partial   +90  *** ** 21
+customers.tckn            CRITICAL  KVKK                             partial   100******46
+customers.ssn             CRITICAL  HIPAA                            redact    [REDACTED:US_SSN]
+customers.iban            HIGH      GDPR,KVKK                        partial   TR33 **** **** **** 1326
+orders.shipping_note      CRITICAL  GDPR,KVKK,PCI-DSS                partial   Call +90  *** ** 21 at gate
+payments.card_number      CRITICAL  PCI-DSS                          last4     ****-****-****-4242
+support_tickets.body      CRITICAL  GDPR,HIPAA,KVKK,PCI-DSS,SECRETS  redact    Hello, please refund order ORD-2026-1001 to my IBAN TR33 **** **** **** 1326...
+
+Recommended denied_tables: api_secrets
+```
+
+<p align="center">
+  <img src="docs/assets/console-discovery.png" alt="pgveil Automatic Schema PII Discovery Console" width="100%" />
+</p>
+
+---
+
+## See It in Action (Real `psql` & `pgx/v5` Wire Sessions)
 
 Connect with any unmodified PostgreSQL client by setting `application_name=claude-mcp` on port `6432`:
 
@@ -75,18 +110,21 @@ SELECT id, email FROM customers;
 NOTICE:  pgveil: result truncated to 25 rows (15 excess rows suppressed by profile "ai_agent" row-exfiltration budget)
 (25 rows)
 
--- 4. AST Firewall blocks destructive SQL, tautologies, modifying CTEs, server escapes & restricted tables
+-- 4. AST Firewall blocks destructive SQL, tautologies, modifying CTEs, server escapes & PII side-channel oracles
 DROP TABLE orders;
 -- ERROR:  DDL / privilege statement (DROP) is blocked for profile "ai_agent" (SQLSTATE 42501)
 
 DELETE FROM orders WHERE 1 = 1;
 -- ERROR:  Unscoped DELETE without effective WHERE clause (or tautology like 1=1) is blocked (SQLSTATE 42501)
 
+SELECT id, full_name FROM customers WHERE tckn LIKE '100000%';
+-- ERROR:  PII side-channel inference blocked: protected column "tckn" referenced in WHERE predicate (SQLSTATE 42501)
+
+SELECT id, SUBSTRING(iban, 1, 10) AS prefix FROM customers;
+-- ERROR:  PII side-channel inference blocked: protected column "iban" referenced in expression function substring() (SQLSTATE 42501)
+
 SELECT pg_read_file('/etc/passwd');
 -- ERROR:  Dangerous PostgreSQL function blocked: pg_read_file (SQLSTATE 42501)
-
-SELECT * FROM api_secrets;
--- ERROR:  Access to restricted table "api_secrets" is denied for profile "ai_agent" (SQLSTATE 42501)
 
 -- 5. Live Synchronous HITL Hold: connection pauses cleanly until an operator clicks Approve in the Web Console
 UPDATE orders SET status = 'refunded' WHERE id = 1001;
@@ -100,9 +138,9 @@ UPDATE 1
 
 ```mermaid
 flowchart LR
-    Clients["Clients & AI Agents<br/>psql · pgx · psycopg · DBeaver<br/>Claude/Cursor MCP · LangChain"] -->|"PostgreSQL Wire Protocol v3<br/>(:6432 TCP / TLS)"| Proxy["pgveil Proxy (Go)<br/>• Simple + Extended Query Framing<br/>• PostgreSQL 17 AST Firewall<br/>• Synchronous HITL Wire Hold<br/>• Dynamic Wire-Speed PII Masker<br/>• Row-Exfiltration Budget Cap<br/>• Embedded Web Console (:8088)"]
+    Clients["Clients & AI Agents<br/>psql · pgx · psycopg · DBeaver<br/>Claude/Cursor MCP · LangChain"] -->|"PostgreSQL Wire Protocol v3<br/>(:6432 TCP / TLS)<br/>or Native MCP stdio"| Proxy["pgveil Proxy & MCP (Go)<br/>• Simple + Extended Query (Cached Stmts)<br/>• PostgreSQL 17 AST + PII Oracle Guard<br/>• Rate Limiter & Runaway Loop Breaker<br/>• Synchronous HITL Hold + Shadow Mode<br/>• Dynamic Wire-Speed PII Masker (8 Packs)<br/>• Embedded Web Console + Discovery (:8088)"]
 
-    Proxy -->|"Policy-Verified SQL"| PG[("PostgreSQL 14–17<br/>Zero Extensions Required")]
+    Proxy -->|"Policy-Verified SQL<br/>(Optional Upstream TLS)"| PG[("PostgreSQL 14–17<br/>RDS · Cloud SQL · Neon · Local")]
 
     Proxy -->|"Non-Blocking Async Events"| Kafka["Apache Kafka / Redpanda<br/>• pgveil.audit.queries<br/>• pgveil.alerts.security"]
     Kafka --> Worker["pgveil-audit-worker (Go)<br/>• Batch pgx Sink (pgveil_audit_log)<br/>• Dead-Letter Queue (DLQ)<br/>• Burst Attack Anomaly Webhook"]
@@ -112,16 +150,19 @@ flowchart LR
 ```
 
 ### Core Engineering Highlights
-- **Full Wire Protocol v3 Parity (`internal/pgwire`, `internal/proxy`):** Transparently handles `SSLRequest` (optional TLS termination), `GSSENCRequest`, `CancelRequest`, `SCRAM-SHA-256` / `MD5` / `cleartext` / `trust` auth relay, Simple Query (`'Q'`), and Extended Query pipelines (`Parse`, `Bind`, `Describe`, `Execute`, `Sync`). On masked Extended Protocol portals, `pgveil` negotiates text result formats on `Bind` so strict drivers (`pgx/v5`, `psycopg3`, `JDBC`) never hit binary decoding errors ([ADR-003](docs/adr/ADR-003-extended-protocol-masking.md)).
-- **PostgreSQL 17 AST Firewall (`internal/firewall`):** Embeds PostgreSQL's own C parser (`libpg_query`) to defeat bypasses that regex proxies miss — modifying CTEs (`WITH d AS (DELETE ...) SELECT * FROM d`), always-true tautologies (`WHERE 1=1`, `WHERE id=5 OR true`), multi-statement SQL injection, nested server escapes (`COALESCE(pg_read_file(...), '')`, `COPY TO PROGRAM`, `DO $$`, `SET ROLE`), and restricted tables hidden inside subqueries ([ADR-002](docs/adr/ADR-002-postgresql-ast-firewall.md)).
-- **Zero-False-Positive Multi-Compliance PII Engine (`internal/pii`):** Built-in packs validated with real mathematical checksums so random numeric IDs are never corrupted:
-  - **`kvkk`** (Türkiye): 11-digit **TCKN** mod-10 checksum, 26-char **TR IBAN** ISO 13616 Mod-97, 10-digit **VKN** tax ID checksum, Turkish mobile phones, email
+- **Full Wire Protocol v3 + Extended Binary Fidelity (`internal/pgwire`, `internal/proxy`):** Supports `SSLRequest` (client TLS termination & upstream TLS for RDS/Cloud SQL/Neon/Supabase), `GSSENCRequest`, `CancelRequest`, `SCRAM-SHA-256` / `MD5` / `cleartext` / `trust` auth relay, Simple Query (`'Q'`), and Extended Query pipelines (`Parse`, `Bind`, `Describe`, `Execute`, `Sync`) with per-session prepared statement metadata caching so strict binary drivers (`pgx/v5`, `psycopg3`, `JDBC`) work seamlessly ([ADR-003](docs/adr/ADR-003-extended-protocol-masking.md)).
+- **PostgreSQL 17 AST Firewall + Side-Channel Oracle Guard (`internal/firewall`):** Embeds PostgreSQL's own C parser (`libpg_query`) to defeat bypasses that regex proxies miss — modifying CTEs (`WITH d AS (DELETE ...) SELECT * FROM d`), always-true tautologies (`WHERE 1=1`, `WHERE id=5 OR true`), multi-statement SQLi, `pg_read_file` / `COPY TO PROGRAM` / `DO $$` / `SET ROLE`, **plus AST side-channel PII inference probes** (`WHERE tckn LIKE '100%'`, `SUBSTRING(iban,1,8) AS x`, `tckn || ''`, `ORDER BY ssn`, `CASE WHEN ssn = ...`) ([ADR-002](docs/adr/ADR-002-postgresql-ast-firewall.md), [ADR-005](docs/adr/ADR-005-pii-inference-and-native-mcp.md)).
+- **Zero-False-Positive 8-Pack Global Compliance Engine (`internal/pii`):**
+  - **`kvkk`** (Türkiye): 11-digit **TCKN** mod-10, 26-char **TR IBAN** ISO 13616 Mod-97, 10-digit **VKN** tax ID checksum, Turkish mobile phones, email
   - **`gdpr`** (EU): **EU IBAN** Mod-97 (`DE`, `FR`, `GB`, `NL`, `ES`, `IT`, ...), email, international phones, IPv4
   - **`pci-dss`**: **Credit Cards** (Visa, Mastercard, Amex, Discover, Troy) with **Luhn + BIN** validation
-  - **`hipaa`** (US): **US SSN** (SSA area/group/serial rules), email, phone
+  - **`hipaa`** (US): **US SSN** (SSA area/group/serial validation), email, phone
+  - **`lgpd`** (Brazil): **Brazilian CPF** (dual mod-11 check digits)
+  - **`pipeda`** (Canada): **Canadian SIN** (Luhn validation)
+  - **`uk-gdpr`** (UK): **UK NINO** (official HMRC prefix exclusion rules)
   - **`secrets`**: AWS access keys (`AKIA...`), GitHub tokens (`ghp_`, `github_pat_`), OpenAI keys (`sk-...`), JWTs, PEM private keys
   - **6 Masking Strategies:** `partial`, `redact`, `last4`, `hash` (HMAC-SHA256 deterministic **JOIN-preserving pseudonymization**), `fake`, and `null`.
-- **Zero-Downtime Policy Hot-Reload:** Update `pgveil.yaml` live via `kill -HUP <pid>` or the Web Console's Policy Editor (`PUT /api/v1/policies/yaml`) with strict pre-swap schema validation.
+- **Enterprise Rollout Safety:** Per-profile **Shadow / Audit-Only Mode (`mode: audit`)** emits `WOULD_BLOCK` / `WOULD_HITL` telemetry without breaking traffic; **Runaway AI-Agent Loop Circuit Breaker & QPM Rate Limiter** (`internal/ratelimit`) stops stuck retry loops with `SQLSTATE 53300`; **Webhook alerts** notify Slack/Teams/Discord on live HITL holds and CRITICAL blocks; **SIGHUP / REST API hot-reload** swaps policies with zero downtime.
 
 ---
 
@@ -138,7 +179,7 @@ All benchmarks below were executed locally on **Apple M3 Pro (arm64)** against *
 | Through `pgveil` — `admin` (Full PG17 AST + Audit) | **29,161 TPS** | `0.274 ms` | **`+0.200 ms`** (`200 µs`) | `0.000%` |
 | Through `pgveil` — `ai_agent` (AST + **25 PII cells/query masked live**) | **25,012 TPS** | `0.320 ms` | **`+0.246 ms`** (`246 µs`) | `0.000%` |
 
-> That translates to **625,000+ dynamically masked PII cells per second** on a single node with **sub-millisecond (`0.246 ms`) overhead** and **0 failed transactions** across 150,098 queries.
+> **625,000+ dynamically masked PII cells per second** on a single node with **sub-millisecond (`0.246 ms`) overhead** and **0 failed transactions** across 150,098 queries.
 
 ### 2. Go Core Microbenchmarks (`go test -bench=. -benchmem`)
 
@@ -146,7 +187,7 @@ All benchmarks below were executed locally on **Apple M3 Pro (arm64)** against *
 |---|---:|---:|---:|
 | `BenchmarkMaskCleanCellFastPath` (O(n) ASCII pre-filter) | **`13.54 ns`** | **`0 B`** | **`0`** |
 | `BenchmarkMaskExplicitColumn` (TCKN partial mask) | **`86.96 ns`** | `272 B` | `3` |
-| `BenchmarkMaskFreeTextWithPII` (all 5 compliance packs) | **`26.31 µs`** | `7,906 B` | `25` |
+| `BenchmarkMaskFreeTextWithPII` (multi-pack content scan) | **`26.31 µs`** | `7,906 B` | `25` |
 | `BenchmarkEvaluateAST` (PG17 C parser on multi-table JOIN) | **`50.35 µs`** | `8,992 B` | `188` |
 
 ### 3. `k6` Control Plane & End-to-End Wire Load Test (`benchmarks/k6/control_plane_load.js`)
@@ -156,7 +197,7 @@ All benchmarks below were executed locally on **Apple M3 Pro (arm64)** against *
 |---|---:|
 | Total Requests / Checks Passed | **25,699 requests** · **57,832 / 57,832 checks (`100.00%`)** |
 | Error Rate (`http_req_failed`) | **`0.00%`** (0 failures, 0 PII leaks) |
-| `/api/v1/inspect` (AST + 5-Pack PII Scan) | **p50 `274 µs`** · **p95 `696.8 µs`** |
+| `/api/v1/inspect` (AST + Multi-Pack PII Scan) | **p50 `274 µs`** · **p95 `696.8 µs`** |
 | `/api/v1/playground/query` (Full TCP Wire Round-Trip) | **p50 `6.0 ms`** · **p95 `10.86 ms`** |
 
 ---
@@ -172,50 +213,46 @@ cd pgveil
 docker compose up --build
 ```
 
-- **Embedded Web Console & Live SQL Playground:** `http://localhost:8088`
+- **Embedded Web Console, Playground & PII Discovery:** `http://localhost:8088`
 - **PostgreSQL Wire Proxy:** `postgres://pgveil:pgveil_dev_password@localhost:6432/pgveil_demo?application_name=claude-mcp`
 - **Grafana Dashboard:** `http://localhost:3000` (`admin` / `pgveil_grafana`)
 - **Jaeger Distributed Traces:** `http://localhost:16686`
-- **Prometheus Metrics:** `http://localhost:8088/metrics`
 
-### Option 2 — Single Binary Against Any Existing PostgreSQL
+### Option 2 — Single Binary CLI (`serve`, `discover`, `mcp`, `scan`, `validate`)
 
 ```bash
 make build
+
+# Start wire proxy + embedded Web Console
 ./bin/pgveil serve --config configs/pgveil.yaml
+
+# Auto-discover unmasked PII columns & generate a pgveil.yaml policy block
+./bin/pgveil discover --dsn "postgres://user:pass@localhost:5432/mydb" --format yaml
+
+# Run zero-Node.js native MCP stdio server (hides denied_tables, enforces AST + PII masking)
+./bin/pgveil mcp --config configs/pgveil.yaml --profile ai_agent
+
+# Test any SQL query against the AST firewall in CI (exits 2 if BLOCKED)
+./bin/pgveil scan --sql "SELECT id FROM customers WHERE tckn LIKE '100000%'" --profile ai_agent
 ```
 
-### Option 3 — CLI Static SQL & PII Policy Scanner (CI/CD Ready)
-
-```bash
-# Validate policy YAML in CI
-./bin/pgveil validate --config configs/pgveil.yaml
-
-# Test any SQL statement against the PostgreSQL 17 AST firewall (exits 2 if BLOCKED)
-./bin/pgveil scan \
-  --sql "WITH d AS (DELETE FROM orders WHERE 1=1 RETURNING *) SELECT * FROM d" \
-  --profile ai_agent
-```
-
-### Option 4 — Protect Claude Desktop / Cursor MCP Postgres in 1 Line
-See [`examples/mcp-claude/claude_desktop_config.json`](examples/mcp-claude/claude_desktop_config.json) and [`examples/python-agent/agent_demo.py`](examples/python-agent/agent_demo.py):
+### Option 3 — Connect Claude Desktop / Cursor MCP (Zero Node.js or Wire Mode)
+Native single-binary MCP ([`examples/mcp-claude/pgveil_native_mcp.json`](examples/mcp-claude/pgveil_native_mcp.json)):
 
 ```json
 {
   "mcpServers": {
-    "postgres-zero-trust": {
-      "command": "npx",
-      "args": [
-        "-y",
-        "@modelcontextprotocol/server-postgres",
-        "postgres://pgveil:pgveil_dev_password@127.0.0.1:6432/pgveil_demo?sslmode=disable&application_name=claude-mcp"
-      ]
+    "pgveil-native-postgres": {
+      "command": "/usr/local/bin/pgveil",
+      "args": ["mcp", "--config", "/path/to/configs/pgveil.yaml", "--profile", "ai_agent"]
     }
   }
 }
 ```
 
-### Option 5 — Production Kubernetes Deployment (Helm)
+Or wire-proxy mode with the official Postgres MCP server ([`examples/mcp-claude/claude_desktop_config.json`](examples/mcp-claude/claude_desktop_config.json)) and Python `psycopg` agent ([`examples/python-agent/agent_demo.py`](examples/python-agent/agent_demo.py)).
+
+### Option 4 — Production Kubernetes Deployment (Helm)
 
 ```bash
 helm lint deploy/helm/pgveil
@@ -225,16 +262,15 @@ helm upgrade --install pgveil deploy/helm/pgveil \
   --set security.maskingSecret="$PGVEIL_MASKING_SECRET"
 ```
 
-Includes non-root `securityContext`, read-only root filesystem, readiness/liveness probes, `HorizontalPodAutoscaler`, `PodDisruptionBudget`, `NetworkPolicy`, and the dedicated `pgveil-audit-worker` Deployment.
-
 ---
 
 ## Architecture Decision Records (ADRs)
 
 - [ADR-001: PostgreSQL Wire Protocol v3 Proxy vs. DB Extensions or ORM Middleware](docs/adr/ADR-001-wire-protocol-proxy.md)
 - [ADR-002: Real PostgreSQL 17 AST Parsing vs. Regex SQL Filtering](docs/adr/ADR-002-postgresql-ast-firewall.md)
-- [ADR-003: Wire-Level Dynamic Masking & Extended Protocol Format Negotiation](docs/adr/ADR-003-extended-protocol-masking.md)
+- [ADR-003: Wire-Level Dynamic Masking & Extended Query Protocol Binary Fidelity](docs/adr/ADR-003-extended-protocol-masking.md)
 - [ADR-004: Non-Blocking Kafka Audit Pipeline & Synchronous HITL Wire Holds](docs/adr/ADR-004-async-kafka-and-live-hitl.md)
+- [ADR-005: AST Side-Channel PII Inference Protection & Native MCP Server Mode](docs/adr/ADR-005-pii-inference-and-native-mcp.md)
 
 ---
 
@@ -243,18 +279,21 @@ Includes non-root `securityContext`, read-only root filesystem, readiness/livene
 ```text
 pgveil/
 ├── cmd/
-│   ├── pgveil/              # Single-binary wire proxy + embedded Web Console CLI (serve, validate, scan)
+│   ├── pgveil/              # Single-binary CLI (serve, discover, mcp, scan, validate) + embedded UI
 │   └── audit-worker/        # Kafka consumer group worker (batch pgx sink, DLQ, burst anomaly alerts)
 ├── internal/
 │   ├── pgwire/              # PostgreSQL Wire Protocol v3 binary framing (Simple & Extended)
-│   ├── firewall/            # PostgreSQL 17 C AST SQL firewall (libpg_query)
-│   ├── pii/                 # Zero-false-positive GDPR, KVKK, PCI-DSS, HIPAA & Secrets masker
-│   ├── proxy/               # Bidirectional wire proxy, row-exfiltration cap & live HITL hold
+│   ├── firewall/            # PostgreSQL 17 C AST SQL firewall + PII side-channel oracle guard
+│   ├── pii/                 # Zero-false-positive 8-pack compliance engine (GDPR/KVKK/PCI/HIPAA/LGPD/PIPEDA/UK/Secrets)
+│   ├── discover/            # Live information_schema PII scanner & YAML policy synthesizer
+│   ├── mcpserver/           # Native zero-dependency JSON-RPC 2.0 MCP stdio server
+│   ├── ratelimit/           # Per-profile QPM limiter & runaway AI-agent loop circuit breaker
+│   ├── proxy/               # Bidirectional wire proxy, upstream TLS, shadow audit mode & live HITL holds
 │   ├── hitl/                # Synchronous approval coordinator with SSE live notifications
 │   ├── policy/              # Declarative YAML RBAC profiles + SIGHUP/API hot-reload
 │   ├── events/              # Non-blocking audit ring buffer, SSE hub & franz-go Kafka producer
 │   ├── telemetry/           # OpenTelemetry OTLP tracing + Prometheus histograms/counters
-│   ├── api/                 # Control Plane REST/SSE API + live wire SQL Playground
+│   ├── api/                 # Control Plane REST/SSE API, live wire Playground & Discovery endpoint
 │   └── webui/               # //go:embed compiled React + TypeScript Control Plane
 ├── web/                     # React 18 + TypeScript + Vite + Tailwind Console source
 ├── configs/pgveil.yaml      # Declarative profiles (ai_agent, analyst, developer, admin)
@@ -262,19 +301,9 @@ pgveil/
 │   ├── docker/              # Postgres demo seed, Prometheus config & Grafana dashboard JSON
 │   └── helm/pgveil/         # Production Kubernetes Helm chart (HPA, PDB, NetworkPolicy)
 ├── benchmarks/              # Reproducible pgbench comparison & k6 load test suite
-├── examples/                # Claude/Cursor MCP & Python psycopg AI agent integrations
+├── examples/                # Native MCP, Claude/Cursor MCP & Python psycopg AI agent integrations
 └── docs/adr/                # Architecture Decision Records
 ```
-
----
-
-## Roadmap
-
-- [ ] Built-in connection multiplexing / transaction pooling mode
-- [ ] Optional Slack & Microsoft Teams interactive approval buttons for live HITL holds
-- [ ] Additional regional compliance packs (Brazilian CPF/CNPJ, UK NINO, Indian Aadhaar)
-- [ ] Automated PII column schema discovery & policy drift alerts
-- [ ] Upstream mTLS client certificate authentication
 
 ---
 

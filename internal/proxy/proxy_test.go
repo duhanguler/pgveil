@@ -242,9 +242,99 @@ func TestEndToEndWireMaskingFirewallAndLiveHITL(t *testing.T) {
 		t.Fatalf("expected UPDATE 1, got %q", tag.String())
 	}
 
-	// Verify audit bus recorded all 4 events cleanly
+	// 5. PII Side-Channel Oracle probe blocked cleanly on the wire
+	if _, err := conn.Exec(ctx, "SELECT id, full_name FROM customers WHERE tckn LIKE '100000%'"); err == nil {
+		t.Fatal("expected PII side-channel WHERE tckn LIKE probe to be blocked")
+	}
+
+	// Verify audit bus recorded all events cleanly
 	sum := bus.Summary()
-	if sum.TotalQueries < 4 || sum.BlockedQueries < 1 || sum.TotalPIIFields < 5 || sum.TruncatedQueries < 1 || sum.HITLTriggered < 1 {
+	if sum.TotalQueries < 5 || sum.BlockedQueries < 2 || sum.TotalPIIFields < 5 || sum.TruncatedQueries < 1 || sum.HITLTriggered < 1 {
 		t.Fatalf("unexpected audit summary: %+v", sum)
+	}
+}
+
+func TestShadowAuditModeAndRunawayLoopBreaker(t *testing.T) {
+	pgAddr, stopPG := startFakePostgres(t)
+	defer stopPG()
+
+	mgr, err := policy.LoadFile("../../configs/pgveil.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := mgr.Config()
+	cfg.Server.ListenAddr = "127.0.0.1:0"
+	cfg.Server.UpstreamAddr = pgAddr
+
+	// Enable loop threshold on ai_agent and set analyst to shadow audit mode
+	for i := range cfg.Profiles {
+		if cfg.Profiles[i].Name == "ai_agent" {
+			cfg.Profiles[i].Firewall.RateLimit.LoopThreshold = 3
+			cfg.Profiles[i].Firewall.RateLimit.LoopWindow = "10s"
+		}
+		if cfg.Profiles[i].Name == "analyst" {
+			cfg.Profiles[i].Mode = "audit"
+		}
+	}
+
+	bus := events.NewBus(100, policy.KafkaConfig{}, nil)
+	defer bus.Close()
+	srv, err := NewServer(mgr, hitl.NewManager(20), bus, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = srv.Start(ctx) }()
+
+	var proxyAddr string
+	for i := 0; i < 50; i++ {
+		if a := srv.Addr(); a != "" {
+			proxyAddr = a
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// 1. Runaway loop circuit breaker trips on 4th identical query from ai_agent
+	dsnAI := "postgres://pgveil:pw@" + proxyAddr + "/pgveil_demo?sslmode=disable&application_name=ai_agent"
+	ccAI, _ := pgx.ParseConfig(dsnAI)
+	ccAI.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	cAI, err := pgx.ConnectConfig(ctx, ccAI)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cAI.Close(ctx)
+
+	for i := 0; i < 3; i++ {
+		rows, err := cAI.Query(ctx, "SELECT id FROM customers LIMIT 1")
+		if err != nil {
+			t.Fatalf("query %d unexpectedly failed: %v", i+1, err)
+		}
+		rows.Close()
+	}
+	if _, err := cAI.Exec(ctx, "SELECT id FROM customers LIMIT 1"); err == nil || !strings.Contains(err.Error(), "Runaway query loop") {
+		t.Fatalf("expected runaway loop circuit breaker error on 4th repeat, got: %v", err)
+	}
+
+	// 2. Shadow/Audit-only mode logs WOULD_BLOCK without breaking the query
+	dsnShadow := "postgres://pgveil:pw@" + proxyAddr + "/pgveil_demo?sslmode=disable&application_name=analyst"
+	ccSh, _ := pgx.ParseConfig(dsnShadow)
+	ccSh.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+	cSh, err := pgx.ConnectConfig(ctx, ccSh)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cSh.Close(ctx)
+
+	rows, err := cSh.Query(ctx, "DROP TABLE orders")
+	if err != nil {
+		t.Fatalf("shadow audit mode should NOT block queries, got: %v", err)
+	}
+	rows.Close()
+
+	recent := bus.Recent(5, "WOULD_BLOCK", "analyst")
+	if len(recent) == 0 {
+		t.Fatalf("expected WOULD_BLOCK audit event in shadow mode, recent=%+v", bus.Recent(5, "", "analyst"))
 	}
 }

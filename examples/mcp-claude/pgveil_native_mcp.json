@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "pgveil-native-postgres": {
+      "command": "/usr/local/bin/pgveil",
+      "args": [
+        "mcp",
+        "--config",
+        "/path/to/configs/pgveil.yaml",
+        "--profile",
+        "ai_agent"
+      ]
+    }
+  }
+}

@@ -15,22 +15,34 @@ import (
 
 // Config is the root pgveil runtime and policy configuration.
 type Config struct {
-	Server         ServerConfig    `yaml:"server" json:"server"`
-	Security       SecurityConfig  `yaml:"security" json:"security"`
-	Telemetry      TelemetryConfig `yaml:"telemetry" json:"telemetry"`
-	Kafka          KafkaConfig     `yaml:"kafka" json:"kafka"`
-	DefaultProfile string          `yaml:"default_profile" json:"default_profile"`
-	Profiles       []RoleProfile   `yaml:"profiles" json:"profiles"`
+	Server         ServerConfig        `yaml:"server" json:"server"`
+	Security       SecurityConfig      `yaml:"security" json:"security"`
+	Notifications  NotificationsConfig `yaml:"notifications" json:"notifications"`
+	Telemetry      TelemetryConfig     `yaml:"telemetry" json:"telemetry"`
+	Kafka          KafkaConfig         `yaml:"kafka" json:"kafka"`
+	DefaultProfile string              `yaml:"default_profile" json:"default_profile"`
+	Profiles       []RoleProfile       `yaml:"profiles" json:"profiles"`
+}
+
+type NotificationsConfig struct {
+	WebhookURL string `yaml:"webhook_url" json:"webhook_url,omitempty"`
 }
 
 type ServerConfig struct {
-	ListenAddr       string    `yaml:"listen_addr" json:"listen_addr"`
-	AdminAddr        string    `yaml:"admin_addr" json:"admin_addr"`
-	UpstreamAddr     string    `yaml:"upstream_addr" json:"upstream_addr"`
-	UpstreamUser     string    `yaml:"upstream_user" json:"upstream_user"`
-	UpstreamPassword string    `yaml:"upstream_password" json:"upstream_password,omitempty"`
-	UpstreamDatabase string    `yaml:"upstream_database" json:"upstream_database"`
-	TLS              TLSConfig `yaml:"tls" json:"tls"`
+	ListenAddr       string            `yaml:"listen_addr" json:"listen_addr"`
+	AdminAddr        string            `yaml:"admin_addr" json:"admin_addr"`
+	UpstreamAddr     string            `yaml:"upstream_addr" json:"upstream_addr"`
+	UpstreamUser     string            `yaml:"upstream_user" json:"upstream_user"`
+	UpstreamPassword string            `yaml:"upstream_password" json:"upstream_password,omitempty"`
+	UpstreamDatabase string            `yaml:"upstream_database" json:"upstream_database"`
+	TLS              TLSConfig         `yaml:"tls" json:"tls"`
+	UpstreamTLS      UpstreamTLSConfig `yaml:"upstream_tls" json:"upstream_tls"`
+}
+
+type UpstreamTLSConfig struct {
+	Enabled            bool   `yaml:"enabled" json:"enabled"`
+	InsecureSkipVerify bool   `yaml:"insecure_skip_verify" json:"insecure_skip_verify"`
+	ServerName         string `yaml:"server_name" json:"server_name"`
 }
 
 type TLSConfig struct {
@@ -65,6 +77,7 @@ type KafkaConfig struct {
 type RoleProfile struct {
 	Name        string         `yaml:"name" json:"name"`
 	Description string         `yaml:"description" json:"description"`
+	Mode        string         `yaml:"mode" json:"mode"` // "enforce" (default) or "audit" (shadow dry-run)
 	Match       MatchCriteria  `yaml:"match" json:"match"`
 	Firewall    FirewallPolicy `yaml:"firewall" json:"firewall"`
 	Masking     MaskingPolicy  `yaml:"masking" json:"masking"`
@@ -74,26 +87,50 @@ type RoleProfile struct {
 	enabledEntities map[pii.EntityType]bool `yaml:"-" json:"-"`
 }
 
+// IsAuditOnly returns true when the profile operates in non-blocking shadow/dry-run rollout mode.
+func (p *RoleProfile) IsAuditOnly() bool {
+	return p != nil && strings.EqualFold(p.Mode, "audit")
+}
+
 type MatchCriteria struct {
 	ApplicationNames []string `yaml:"application_names" json:"application_names"`
 	Users            []string `yaml:"users" json:"users"`
 }
 
+type RateLimitPolicy struct {
+	MaxQueriesPerMinute int    `yaml:"max_queries_per_minute" json:"max_queries_per_minute"`
+	LoopThreshold       int    `yaml:"loop_threshold" json:"loop_threshold"`
+	LoopWindow          string `yaml:"loop_window" json:"loop_window"`
+}
+
 type FirewallPolicy struct {
-	AllowStatements          []string `yaml:"allow_statements" json:"allow_statements"`
-	BlockDDL                 bool     `yaml:"block_ddl" json:"block_ddl"`
-	BlockMultiStatement      bool     `yaml:"block_multi_statement" json:"block_multi_statement"`
-	BlockWriteWithoutWhere   bool     `yaml:"block_write_without_where" json:"block_write_without_where"`
-	BlockDangerousFunctions  bool     `yaml:"block_dangerous_functions" json:"block_dangerous_functions"`
-	BlockSystemCatalogs      bool     `yaml:"block_system_catalogs" json:"block_system_catalogs"`
-	RequireHITLStatements    []string `yaml:"require_hitl_statements" json:"require_hitl_statements"`
-	HITLMode                 string   `yaml:"hitl_mode" json:"hitl_mode"`
-	HITLTimeout              string   `yaml:"hitl_timeout" json:"hitl_timeout"`
-	AllowedTables            []string `yaml:"allowed_tables" json:"allowed_tables"`
-	DeniedTables             []string `yaml:"denied_tables" json:"denied_tables"`
-	MaxRows                  int      `yaml:"max_rows" json:"max_rows"`
-	MaxRowsAction            string   `yaml:"max_rows_action" json:"max_rows_action"`
-	BlockSelectStarOnPII     bool     `yaml:"block_select_star_on_pii_tables" json:"block_select_star_on_pii_tables"`
+	AllowStatements         []string        `yaml:"allow_statements" json:"allow_statements"`
+	BlockDDL                bool            `yaml:"block_ddl" json:"block_ddl"`
+	BlockMultiStatement     bool            `yaml:"block_multi_statement" json:"block_multi_statement"`
+	BlockWriteWithoutWhere  bool            `yaml:"block_write_without_where" json:"block_write_without_where"`
+	BlockDangerousFunctions bool            `yaml:"block_dangerous_functions" json:"block_dangerous_functions"`
+	BlockSystemCatalogs     bool            `yaml:"block_system_catalogs" json:"block_system_catalogs"`
+	BlockPIIInference       bool            `yaml:"block_pii_inference" json:"block_pii_inference"`
+	ProtectedColumns        []string        `yaml:"protected_columns" json:"protected_columns"`
+	RequireHITLStatements   []string        `yaml:"require_hitl_statements" json:"require_hitl_statements"`
+	HITLMode                string          `yaml:"hitl_mode" json:"hitl_mode"`
+	HITLTimeout             string          `yaml:"hitl_timeout" json:"hitl_timeout"`
+	AllowedTables           []string        `yaml:"allowed_tables" json:"allowed_tables"`
+	DeniedTables            []string        `yaml:"denied_tables" json:"denied_tables"`
+	MaxRows                 int             `yaml:"max_rows" json:"max_rows"`
+	MaxRowsAction           string          `yaml:"max_rows_action" json:"max_rows_action"`
+	BlockSelectStarOnPII    bool            `yaml:"block_select_star_on_pii_tables" json:"block_select_star_on_pii_tables"`
+	RateLimit               RateLimitPolicy `yaml:"rate_limit" json:"rate_limit"`
+}
+
+// LoopWindowDuration returns the parsed runaway-loop detection window.
+func (f FirewallPolicy) LoopWindowDuration() time.Duration {
+	if f.RateLimit.LoopWindow != "" {
+		if d, err := time.ParseDuration(f.RateLimit.LoopWindow); err == nil && d > 0 {
+			return d
+		}
+	}
+	return 15 * time.Second
 }
 
 type MaskingPolicy struct {
@@ -352,6 +389,12 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("PGVEIL_OTEL_ENDPOINT"); v != "" {
 		cfg.Telemetry.OTelEndpoint = v
 	}
+	if v := os.Getenv("PGVEIL_ALERT_WEBHOOK"); v != "" {
+		cfg.Notifications.WebhookURL = v
+	}
+	if v := os.Getenv("PGVEIL_UPSTREAM_TLS"); v == "true" || v == "1" {
+		cfg.Server.UpstreamTLS.Enabled = true
+	}
 }
 
 func applyDefaults(cfg *Config) {
@@ -383,6 +426,9 @@ func applyDefaults(cfg *Config) {
 		cfg.Kafka.ClientID = "pgveil-proxy"
 	}
 	for i := range cfg.Profiles {
+		if cfg.Profiles[i].Mode == "" {
+			cfg.Profiles[i].Mode = "enforce"
+		}
 		if cfg.Profiles[i].Firewall.MaxRowsAction == "" {
 			cfg.Profiles[i].Firewall.MaxRowsAction = "truncate"
 		}
@@ -406,6 +452,9 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("duplicate profile name %q", p.Name)
 		}
 		seen[p.Name] = true
+		if p.Mode != "" && p.Mode != "enforce" && p.Mode != "audit" {
+			return fmt.Errorf("profile %q: invalid mode %q (must be enforce or audit)", p.Name, p.Mode)
+		}
 		if p.Firewall.MaxRowsAction != "truncate" && p.Firewall.MaxRowsAction != "block" {
 			return fmt.Errorf("profile %q: invalid max_rows_action %q (must be truncate or block)", p.Name, p.Firewall.MaxRowsAction)
 		}

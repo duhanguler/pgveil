@@ -107,7 +107,7 @@ func defaultStrategyForEntity(t EntityType) Strategy {
 	switch t {
 	case EntityCreditCard:
 		return StrategyLast4
-	case EntityPrivateKey, EntityAWSAccessKey, EntityGitHubToken, EntityOpenAIKey, EntityJWT, EntityUSSSN:
+	case EntityPrivateKey, EntityAWSAccessKey, EntityGitHubToken, EntityOpenAIKey, EntityJWT, EntityUSSSN, EntityCASIN, EntityUKNINO:
 		return StrategyRedact
 	default:
 		return StrategyPartial

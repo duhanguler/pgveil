@@ -42,6 +42,8 @@ data:
           block_write_without_where: true
           block_dangerous_functions: true
           block_system_catalogs: true
+          block_pii_inference: true
+          protected_columns: ["tckn", "ssn", "iban", "card_number", "secret_value"]
           require_hitl_statements: ["UPDATE", "DELETE", "INSERT"]
           hitl_mode: "hold"
           hitl_timeout: "60s"

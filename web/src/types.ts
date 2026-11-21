@@ -115,3 +115,29 @@ export interface PlaygroundResult {
   detail?: string
   audit?: AuditEvent
 }
+
+export interface DiscoveryFinding {
+  schema: string
+  table: string
+  column: string
+  data_type: string
+  sampled_rows: number
+  matched_rows: number
+  detected_entities: Record<string, number>
+  compliance_packs: string[]
+  risk_level: string
+  recommended_strategy: string
+  detection_source: string
+  sample_masked?: string
+}
+
+export interface DiscoveryReport {
+  scanned_at: string
+  database: string
+  tables_scanned: number
+  columns_scanned: number
+  findings_count: number
+  findings: DiscoveryFinding[]
+  recommended_denied_tables?: string[]
+  generated_yaml: string
+}

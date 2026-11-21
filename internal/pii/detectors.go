@@ -20,6 +20,9 @@ const (
 	EntityPhoneTR      EntityType = "tr_phone"
 	EntityPhoneIntl    EntityType = "phone_intl"
 	EntityIPv4         EntityType = "ipv4"
+	EntityBRCPF        EntityType = "br_cpf"
+	EntityCASIN        EntityType = "ca_sin"
+	EntityUKNINO       EntityType = "uk_nino"
 	EntityAWSAccessKey EntityType = "aws_access_key"
 	EntityGitHubToken  EntityType = "github_token"
 	EntityOpenAIKey    EntityType = "openai_key"
@@ -35,6 +38,9 @@ const (
 	PackKVKK    CompliancePack = "kvkk"
 	PackPCIDSS  CompliancePack = "pci-dss"
 	PackHIPAA   CompliancePack = "hipaa"
+	PackLGPD    CompliancePack = "lgpd"
+	PackPIPEDA  CompliancePack = "pipeda"
+	PackUKGDPR  CompliancePack = "uk-gdpr"
 	PackSecrets CompliancePack = "secrets"
 )
 
@@ -58,6 +64,22 @@ var PackEntities = map[CompliancePack][]EntityType{
 	},
 	PackHIPAA: {
 		EntityUSSSN,
+		EntityEmail,
+		EntityPhoneIntl,
+	},
+	PackLGPD: {
+		EntityBRCPF,
+		EntityEmail,
+		EntityPhoneIntl,
+	},
+	PackPIPEDA: {
+		EntityCASIN,
+		EntityEmail,
+		EntityPhoneIntl,
+	},
+	PackUKGDPR: {
+		EntityUKNINO,
+		EntityEUIBAN,
 		EntityEmail,
 		EntityPhoneIntl,
 	},
@@ -88,6 +110,9 @@ var (
 	reCreditCard   = regexp.MustCompile(`\b(?:\d[ -]?){13,19}\b`)
 	reEmail        = regexp.MustCompile(`\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b`)
 	reUSSSN        = regexp.MustCompile(`\b(\d{3}-\d{2}-\d{4})\b`)
+	reBRCPF        = regexp.MustCompile(`\b(\d{3}\.\d{3}\.\d{3}-\d{2})\b`)
+	reCASIN        = regexp.MustCompile(`\b(\d{3}-\d{3}-\d{3})\b`)
+	reUKNINO       = regexp.MustCompile(`\b([A-CEGHJ-PR-TW-Z]{2}\s?\d{2}\s?\d{2}\s?\d{2}\s?[A-D])\b`)
 	rePhoneTR      = regexp.MustCompile(`(?:\+90|0090|0)\s*5\d{2}[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}\b`)
 	rePhoneIntl    = regexp.MustCompile(`\+(?:[1-9]\d{0,2})[\s\-]?(?:\(?\d{1,4}\)?[\s\-]?){2,4}\d{2,4}\b`)
 	reTCKN         = regexp.MustCompile(`\b([1-9]\d{10})\b`)
@@ -263,6 +288,114 @@ func ValidateUSSSN(raw string) bool {
 	return true
 }
 
+// ValidateBRCPF verifies Brazilian CPF (11 digits, dual mod-11 check digits, rejects repeated digits).
+func ValidateBRCPF(raw string) bool {
+	var d [11]int
+	idx := 0
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		if c >= '0' && c <= '9' {
+			if idx >= 11 {
+				return false
+			}
+			d[idx] = int(c - '0')
+			idx++
+		} else if c != '.' && c != '-' {
+			return false
+		}
+	}
+	if idx != 11 {
+		return false
+	}
+	allSame := true
+	for i := 1; i < 11; i++ {
+		if d[i] != d[0] {
+			allSame = false
+			break
+		}
+	}
+	if allSame {
+		return false
+	}
+	sum1 := 0
+	for i := 0; i < 9; i++ {
+		sum1 += d[i] * (10 - i)
+	}
+	r1 := (sum1 * 10) % 11
+	if r1 == 10 {
+		r1 = 0
+	}
+	if d[9] != r1 {
+		return false
+	}
+	sum2 := 0
+	for i := 0; i < 10; i++ {
+		sum2 += d[i] * (11 - i)
+	}
+	r2 := (sum2 * 10) % 11
+	if r2 == 10 {
+		r2 = 0
+	}
+	return d[10] == r2
+}
+
+// ValidateCASIN verifies Canadian Social Insurance Number (9 digits, Luhn checksum).
+func ValidateCASIN(raw string) bool {
+	var d [9]int
+	idx := 0
+	for i := 0; i < len(raw); i++ {
+		c := raw[i]
+		if c >= '0' && c <= '9' {
+			if idx >= 9 {
+				return false
+			}
+			d[idx] = int(c - '0')
+			idx++
+		} else if c != '-' && c != ' ' {
+			return false
+		}
+	}
+	if idx != 9 || d[0] == 0 || d[0] == 8 {
+		return false
+	}
+	sum := 0
+	for i := 0; i < 9; i++ {
+		v := d[i]
+		if i%2 == 1 {
+			v *= 2
+			if v > 9 {
+				v -= 9
+			}
+		}
+		sum += v
+	}
+	return sum%10 == 0
+}
+
+// ValidateUKNINO verifies official HMRC UK National Insurance Number prefix rules.
+func ValidateUKNINO(raw string) bool {
+	clean := strings.ToUpper(strings.ReplaceAll(raw, " ", ""))
+	if len(clean) != 9 {
+		return false
+	}
+	prefix := clean[:2]
+	disallowed := map[string]bool{
+		"BG": true, "GB": true, "KN": true, "NK": true, "NT": true, "TN": true, "ZZ": true,
+	}
+	if disallowed[prefix] {
+		return false
+	}
+	if strings.ContainsRune("DFIQUV", rune(clean[0])) || strings.ContainsRune("DFIOQUV", rune(clean[1])) {
+		return false
+	}
+	for i := 2; i < 8; i++ {
+		if clean[i] < '0' || clean[i] > '9' {
+			return false
+		}
+	}
+	return clean[8] >= 'A' && clean[8] <= 'D'
+}
+
 // ResolveEnabledEntities expands compliance pack names into a set of active EntityTypes.
 func ResolveEnabledEntities(packs []string) map[EntityType]bool {
 	enabled := make(map[EntityType]bool, 16)
@@ -373,10 +506,13 @@ func Detect(text string, enabled map[EntityType]bool) []Match {
 		addMatches(reEmail, EntityEmail, nil)
 	}
 
-	// 5. US SSN
+	// 5. National IDs (US SSN, Brazil CPF, Canada SIN, UK NINO)
 	if strings.ContainsRune(text, '-') {
 		addMatches(reUSSSN, EntityUSSSN, ValidateUSSSN)
+		addMatches(reBRCPF, EntityBRCPF, ValidateBRCPF)
+		addMatches(reCASIN, EntityCASIN, ValidateCASIN)
 	}
+	addMatches(reUKNINO, EntityUKNINO, ValidateUKNINO)
 
 	// 6. Contextual VKN (10-digit Turkish Tax ID)
 	if enabled[EntityVKN] {

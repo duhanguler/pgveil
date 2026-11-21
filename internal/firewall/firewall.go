@@ -230,7 +230,21 @@ func Evaluate(sql string, profile *policy.RoleProfile) Decision {
 		}
 	}
 
-	// 6. Optional SELECT * guard on tables
+	// 6. PII Side-Channel / Oracle Inference Guard (WHERE tckn LIKE '100%', SUBSTRING(iban,1,6), ORDER BY ssn)
+	if fw.BlockPIIInference {
+		protected := resolveProtectedColumns(profile)
+		if len(protected) > 0 {
+			if col, via := detectPIIInference(tree, protected); col != "" {
+				dec.Action = ActionBlock
+				dec.RiskLevel = "HIGH"
+				dec.Rule = "pii_side_channel_inference"
+				dec.Reason = fmt.Sprintf("PII side-channel inference blocked: protected column %q referenced in %s", col, via)
+				return dec
+			}
+		}
+	}
+
+	// 7. Optional SELECT * guard on tables
 	if fw.BlockSelectStarOnPII && analysis.hasSelectStar && len(analysis.tables) > 0 {
 		dec.Action = ActionBlock
 		dec.RiskLevel = "MEDIUM"
@@ -741,4 +755,267 @@ func stripSchema(name string) string {
 		return name[idx+1:]
 	}
 	return name
+}
+
+// piiExfilFuncs are string/encoding/hashing functions that could slice or transform
+// a masked column into a new alias to evade wire-level column masking or leak bits.
+var piiExfilFuncs = map[string]bool{
+	"substring":      true,
+	"substr":         true,
+	"left":           true,
+	"right":          true,
+	"ascii":          true,
+	"length":         true,
+	"char_length":    true,
+	"octet_length":   true,
+	"md5":            true,
+	"encode":         true,
+	"decode":         true,
+	"split_part":     true,
+	"regexp_match":   true,
+	"regexp_matches": true,
+	"regexp_replace": true,
+	"regexp_substr":  true,
+	"reverse":        true,
+	"concat":         true,
+	"concat_ws":      true,
+	"overlay":        true,
+	"replace":        true,
+	"position":       true,
+	"strpos":         true,
+	"translate":      true,
+	"btrim":          true,
+	"ltrim":          true,
+	"rtrim":          true,
+}
+
+func resolveProtectedColumns(profile *policy.RoleProfile) map[string]bool {
+	set := make(map[string]bool)
+	if profile == nil {
+		return set
+	}
+	if len(profile.Firewall.ProtectedColumns) > 0 {
+		for _, c := range profile.Firewall.ProtectedColumns {
+			if s := strings.ToLower(strings.TrimSpace(c)); s != "" {
+				set[s] = true
+			}
+		}
+		return set
+	}
+	for _, r := range profile.Masking.ColumnRules {
+		if s := strings.ToLower(strings.TrimSpace(r.Column)); s != "" {
+			set[s] = true
+		}
+	}
+	return set
+}
+
+// detectPIIInference traverses the PostgreSQL 17 AST to catch side-channel oracle probes
+// against masked PII columns in WHERE/HAVING predicates, ORDER BY/GROUP BY clauses,
+// and string-slicing/encoding functions (e.g. SUBSTRING(tckn, 1, 5) AS prefix).
+func detectPIIInference(tree *pg_query.ParseResult, protected map[string]bool) (col string, via string) {
+	var walkStmt func(n *pg_query.Node) (string, string)
+	var findColInExpr func(n *pg_query.Node) string
+	findColInExpr = func(n *pg_query.Node) string {
+		if n == nil {
+			return ""
+		}
+		switch inner := n.Node.(type) {
+		case *pg_query.Node_ColumnRef:
+			if len(inner.ColumnRef.Fields) > 0 {
+				last := inner.ColumnRef.Fields[len(inner.ColumnRef.Fields)-1]
+				if s := last.GetString_(); s != nil {
+					name := strings.ToLower(s.Sval)
+					if protected[name] {
+						return name
+					}
+				}
+			}
+		case *pg_query.Node_AExpr:
+			if c := findColInExpr(inner.AExpr.Lexpr); c != "" {
+				return c
+			}
+			return findColInExpr(inner.AExpr.Rexpr)
+		case *pg_query.Node_BoolExpr:
+			for _, a := range inner.BoolExpr.Args {
+				if c := findColInExpr(a); c != "" {
+					return c
+				}
+			}
+		case *pg_query.Node_FuncCall:
+			for _, a := range inner.FuncCall.Args {
+				if c := findColInExpr(a); c != "" {
+					return c
+				}
+			}
+		case *pg_query.Node_TypeCast:
+			return findColInExpr(inner.TypeCast.Arg)
+		case *pg_query.Node_NullTest:
+			return findColInExpr(inner.NullTest.Arg)
+		case *pg_query.Node_CaseExpr:
+			if c := findColInExpr(inner.CaseExpr.Arg); c != "" {
+				return c
+			}
+			for _, w := range inner.CaseExpr.Args {
+				if c := findColInExpr(w); c != "" {
+					return c
+				}
+			}
+			return findColInExpr(inner.CaseExpr.Defresult)
+		case *pg_query.Node_CaseWhen:
+			if c := findColInExpr(inner.CaseWhen.Expr); c != "" {
+				return c
+			}
+			return findColInExpr(inner.CaseWhen.Result)
+		case *pg_query.Node_CoalesceExpr:
+			for _, a := range inner.CoalesceExpr.Args {
+				if c := findColInExpr(a); c != "" {
+					return c
+				}
+			}
+		case *pg_query.Node_SubLink:
+			if c := findColInExpr(inner.SubLink.Testexpr); c != "" {
+				return c
+			}
+			return findColInExpr(inner.SubLink.Subselect)
+		case *pg_query.Node_List:
+			for _, item := range inner.List.Items {
+				if c := findColInExpr(item); c != "" {
+					return c
+				}
+			}
+		case *pg_query.Node_ResTarget:
+			return findColInExpr(inner.ResTarget.Val)
+		case *pg_query.Node_SortBy:
+			return findColInExpr(inner.SortBy.Node)
+		}
+		return ""
+	}
+
+	var checkTargetsForTransform func(n *pg_query.Node) (string, string)
+	checkTargetsForTransform = func(n *pg_query.Node) (string, string) {
+		if n == nil {
+			return "", ""
+		}
+		switch inner := n.Node.(type) {
+		case *pg_query.Node_ResTarget:
+			return checkTargetsForTransform(inner.ResTarget.Val)
+		case *pg_query.Node_FuncCall:
+			if len(inner.FuncCall.Funcname) > 0 {
+				last := inner.FuncCall.Funcname[len(inner.FuncCall.Funcname)-1]
+				if s := last.GetString_(); s != nil {
+					fn := strings.ToLower(s.Sval)
+					if piiExfilFuncs[fn] {
+						for _, arg := range inner.FuncCall.Args {
+							if c := findColInExpr(arg); c != "" {
+								return c, fmt.Sprintf("expression function %s()", fn)
+							}
+						}
+					}
+				}
+			}
+			for _, arg := range inner.FuncCall.Args {
+				if c, v := checkTargetsForTransform(arg); c != "" {
+					return c, v
+				}
+			}
+		case *pg_query.Node_AExpr:
+			// Catch string concatenation operator `||` or comparison in projection (e.g. SELECT tckn || '' AS x)
+			if inner.AExpr.Kind == pg_query.A_Expr_Kind_AEXPR_OP && len(inner.AExpr.Name) == 1 {
+				if op := inner.AExpr.Name[0].GetString_(); op != nil && (op.Sval == "||" || op.Sval == "=" || op.Sval == "~~" || op.Sval == "~~*") {
+					if c := findColInExpr(n); c != "" {
+						return c, fmt.Sprintf("projection operator %q", op.Sval)
+					}
+				}
+			}
+			if c, v := checkTargetsForTransform(inner.AExpr.Lexpr); c != "" {
+				return c, v
+			}
+			return checkTargetsForTransform(inner.AExpr.Rexpr)
+		case *pg_query.Node_CaseExpr:
+			if c := findColInExpr(n); c != "" {
+				return c, "CASE projection"
+			}
+		case *pg_query.Node_TypeCast:
+			return checkTargetsForTransform(inner.TypeCast.Arg)
+		case *pg_query.Node_SubLink:
+			return walkStmt(inner.SubLink.Subselect)
+		}
+		return "", ""
+	}
+
+	walkStmt = func(n *pg_query.Node) (string, string) {
+		if n == nil {
+			return "", ""
+		}
+		switch inner := n.Node.(type) {
+		case *pg_query.Node_SelectStmt:
+			s := inner.SelectStmt
+			if s.WithClause != nil {
+				for _, cte := range s.WithClause.Ctes {
+					if cteNode := cte.GetCommonTableExpr(); cteNode != nil {
+						if c, v := walkStmt(cteNode.Ctequery); c != "" {
+							return c, v
+						}
+					}
+				}
+			}
+			if c := findColInExpr(s.WhereClause); c != "" {
+				return c, "WHERE predicate"
+			}
+			if c := findColInExpr(s.HavingClause); c != "" {
+				return c, "HAVING predicate"
+			}
+			for _, sb := range s.SortClause {
+				if c := findColInExpr(sb); c != "" {
+					return c, "ORDER BY clause"
+				}
+			}
+			for _, gb := range s.GroupClause {
+				if c := findColInExpr(gb); c != "" {
+					return c, "GROUP BY clause"
+				}
+			}
+			for _, tl := range s.TargetList {
+				if c, v := checkTargetsForTransform(tl); c != "" {
+					return c, v
+				}
+			}
+			for _, fc := range s.FromClause {
+				if c, v := walkStmt(fc); c != "" {
+					return c, v
+				}
+			}
+			if s.Larg != nil {
+				if c, v := walkStmt(&pg_query.Node{Node: &pg_query.Node_SelectStmt{SelectStmt: s.Larg}}); c != "" {
+					return c, v
+				}
+			}
+			if s.Rarg != nil {
+				if c, v := walkStmt(&pg_query.Node{Node: &pg_query.Node_SelectStmt{SelectStmt: s.Rarg}}); c != "" {
+					return c, v
+				}
+			}
+		case *pg_query.Node_RangeSubselect:
+			return walkStmt(inner.RangeSubselect.Subquery)
+		case *pg_query.Node_JoinExpr:
+			if c := findColInExpr(inner.JoinExpr.Quals); c != "" {
+				return c, "JOIN predicate"
+			}
+			if c, v := walkStmt(inner.JoinExpr.Larg); c != "" {
+				return c, v
+			}
+			return walkStmt(inner.JoinExpr.Rarg)
+		}
+		return "", ""
+	}
+
+	for _, raw := range tree.Stmts {
+		if raw != nil && raw.Stmt != nil {
+			if c, v := walkStmt(raw.Stmt); c != "" {
+				return c, v
+			}
+		}
+	}
+	return "", ""
 }

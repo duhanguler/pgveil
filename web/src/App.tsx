@@ -19,17 +19,19 @@ import {
   RefreshCw,
   Copy,
   Check,
-  Layers
+  Layers,
+  ScanSearch
 } from 'lucide-react'
 import type {
   ApprovalRequest,
   AuditEvent,
+  DiscoveryReport,
   PlaygroundResult,
   RoleProfile,
   Summary
 } from './types'
 
-type Tab = 'playground' | 'approvals' | 'audit' | 'policies' | 'observability'
+type Tab = 'playground' | 'discovery' | 'approvals' | 'audit' | 'policies' | 'observability'
 
 interface Preset {
   label: string
@@ -67,6 +69,20 @@ const PRESETS: Preset[] = [
     tone: 'amber',
     sql: "UPDATE orders\nSET status = 'refunded'\nWHERE id = 1001;",
     description: 'Pauses the live PostgreSQL connection until a human operator clicks Approve or Deny.'
+  },
+  {
+    label: 'PII Side-Channel (WHERE tckn LIKE)',
+    badge: 'ORACLE GUARD',
+    tone: 'rose',
+    sql: "SELECT id, full_name FROM customers\nWHERE tckn LIKE '100000%';",
+    description: 'AST side-channel guard blocks brute-force inference probes against masked PII columns.'
+  },
+  {
+    label: 'SUBSTRING Alias Bypass (iban)',
+    badge: 'ORACLE GUARD',
+    tone: 'rose',
+    sql: 'SELECT id, SUBSTRING(iban, 1, 10) AS prefix\nFROM customers;',
+    description: 'Stops AI agents from slicing or aliasing protected PII columns to evade wire masking.'
   },
   {
     label: 'DROP TABLE Attack',
@@ -108,6 +124,9 @@ function decisionBadge(decision: string) {
       return 'bg-amber-500/15 text-amber-300 border-amber-500/30'
     case 'HITL_APPROVED':
       return 'bg-indigo-500/15 text-indigo-300 border-indigo-500/30'
+    case 'WOULD_BLOCK':
+    case 'WOULD_HITL':
+      return 'bg-purple-500/15 text-purple-300 border-purple-500/30'
     case 'BLOCKED':
     case 'HITL_DENIED':
     case 'HITL_EXPIRED':
@@ -164,6 +183,33 @@ export default function App() {
   const [savingPolicy, setSavingPolicy] = useState(false)
   const [policyNotice, setPolicyNotice] = useState<{ ok: boolean; msg: string } | null>(null)
   const [copiedSnippet, setCopiedSnippet] = useState<string | null>(null)
+
+  // Schema PII Discovery state
+  const [discovering, setDiscovering] = useState(false)
+  const [discoveryReport, setDiscoveryReport] = useState<DiscoveryReport | null>(null)
+  const [discoveryErr, setDiscoveryErr] = useState<string | null>(null)
+
+  const runDiscovery = async () => {
+    setDiscovering(true)
+    setDiscoveryErr(null)
+    try {
+      const res = await fetch('/api/v1/discover', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sample_rows: 50 })
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        setDiscoveryErr(data.error || 'Discovery scan failed')
+      } else {
+        setDiscoveryReport(data)
+      }
+    } catch (err) {
+      setDiscoveryErr(String(err))
+    } finally {
+      setDiscovering(false)
+    }
+  }
 
   const summaryTimerRef = useRef<number | null>(null)
 
@@ -356,6 +402,7 @@ export default function App() {
           <nav className="flex items-center gap-1 bg-slate-900/90 p-1 rounded-xl border border-slate-800 shrink-0">
             {[
               { id: 'playground', label: 'SQL Playground', icon: Terminal },
+              { id: 'discovery', label: 'PII Discovery', icon: ScanSearch },
               { id: 'approvals', label: 'HITL Approvals', icon: Clock, count: pendingApprovals.length },
               { id: 'audit', label: 'Audit Stream', icon: Activity },
               { id: 'policies', label: 'Policies', icon: Sliders },
@@ -752,6 +799,144 @@ export default function App() {
           </div>
         )}
 
+        {/* TAB 1.5: AUTOMATIC SCHEMA PII DISCOVERY */}
+        {tab === 'discovery' && (
+          <div className="space-y-5">
+            <div className="flex items-center justify-between flex-wrap gap-3">
+              <div>
+                <h2 className="text-lg font-semibold flex items-center gap-2">
+                  <ScanSearch className="w-5 h-5 text-emerald-400" />
+                  Automatic Schema PII &amp; Secrets Discovery
+                </h2>
+                <p className="text-xs text-slate-400 mt-0.5">
+                  Samples live PostgreSQL tables against 8 checksum-validated compliance packs (GDPR, KVKK, PCI-DSS, HIPAA, LGPD, PIPEDA, UK-GDPR, Secrets) and auto-generates pgveil policy rules.
+                </p>
+              </div>
+              <button
+                onClick={runDiscovery}
+                disabled={discovering}
+                className="px-4 py-2 rounded-lg bg-emerald-500 hover:bg-emerald-400 disabled:opacity-60 text-slate-950 font-semibold text-xs flex items-center gap-2 shadow-lg shadow-emerald-500/20"
+              >
+                <ScanSearch className="w-4 h-4" />
+                {discovering ? 'Scanning Live Schema...' : 'Scan Live PostgreSQL Schema'}
+              </button>
+            </div>
+
+            {discoveryErr && (
+              <div className="rounded-xl bg-rose-950/40 border border-rose-500/40 p-4 text-xs font-mono text-rose-200">
+                {discoveryErr}
+              </div>
+            )}
+
+            {!discoveryReport && !discovering && (
+              <div className="rounded-xl bg-slate-900/70 border border-slate-800 p-10 text-center space-y-3">
+                <ScanSearch className="w-10 h-10 text-emerald-400/70 mx-auto" />
+                <div className="text-sm text-slate-200 font-medium">Zero-Config Compliance Audit</div>
+                <p className="text-xs text-slate-400 max-w-lg mx-auto">
+                  Click <strong>Scan Live PostgreSQL Schema</strong> (or run <code>pgveil discover --dsn ...</code> in CLI) to automatically detect unmasked TCKNs, IBANs, credit cards, SSNs, emails, and leaked cloud secrets across every table.
+                </p>
+              </div>
+            )}
+
+            {discoveryReport && (
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
+                <div className="lg:col-span-8 space-y-4">
+                  <div className="grid grid-cols-3 gap-3">
+                    <div className="rounded-xl bg-slate-900/80 border border-slate-800 p-3">
+                      <div className="text-[11px] text-slate-400">Database / Tables</div>
+                      <div className="text-sm font-mono font-bold text-white mt-0.5">
+                        {discoveryReport.database} ({discoveryReport.tables_scanned} tables)
+                      </div>
+                    </div>
+                    <div className="rounded-xl bg-slate-900/80 border border-slate-800 p-3">
+                      <div className="text-[11px] text-slate-400">Columns Scanned</div>
+                      <div className="text-sm font-mono font-bold text-cyan-300 mt-0.5">
+                        {discoveryReport.columns_scanned}
+                      </div>
+                    </div>
+                    <div className="rounded-xl bg-slate-900/80 border border-slate-800 p-3">
+                      <div className="text-[11px] text-slate-400">Sensitive Columns Found</div>
+                      <div className="text-sm font-mono font-bold text-amber-300 mt-0.5">
+                        {discoveryReport.findings_count}
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="rounded-xl bg-slate-900/80 border border-slate-800 overflow-hidden">
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left border-collapse text-xs font-mono">
+                        <thead className="bg-slate-950 text-slate-400 border-b border-slate-800">
+                          <tr>
+                            <th className="px-3 py-2.5">Table.Column</th>
+                            <th className="px-3 py-2.5">Risk</th>
+                            <th className="px-3 py-2.5">Compliance</th>
+                            <th className="px-3 py-2.5">Strategy</th>
+                            <th className="px-3 py-2.5">Masked Preview</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-800/60">
+                          {discoveryReport.findings.map((f, idx) => (
+                            <tr key={idx} className="hover:bg-slate-800/40">
+                              <td className="px-3 py-2 text-slate-200 whitespace-nowrap">
+                                <span className="text-slate-400">{f.table}.</span>
+                                <strong className="text-white">{f.column}</strong>
+                              </td>
+                              <td className="px-3 py-2 whitespace-nowrap">
+                                <span
+                                  className={`px-1.5 py-0.5 rounded border text-[10px] ${
+                                    f.risk_level === 'CRITICAL'
+                                      ? 'bg-rose-500/15 text-rose-300 border-rose-500/30'
+                                      : f.risk_level === 'HIGH'
+                                      ? 'bg-amber-500/15 text-amber-300 border-amber-500/30'
+                                      : 'bg-cyan-500/15 text-cyan-300 border-cyan-500/30'
+                                  }`}
+                                >
+                                  {f.risk_level}
+                                </span>
+                              </td>
+                              <td className="px-3 py-2">
+                                <div className="flex flex-wrap gap-1">
+                                  {f.compliance_packs.map((pk) => (
+                                    <span
+                                      key={pk}
+                                      className="px-1.5 py-0.5 rounded bg-emerald-500/10 border border-emerald-500/25 text-emerald-300 text-[10px] uppercase"
+                                    >
+                                      {pk}
+                                    </span>
+                                  ))}
+                                </div>
+                              </td>
+                              <td className="px-3 py-2 text-indigo-300">{f.recommended_strategy}</td>
+                              <td className="px-3 py-2 text-emerald-300 max-w-xs truncate" title={f.sample_masked}>
+                                {f.sample_masked}
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="lg:col-span-4 space-y-3">
+                  <CodeBlock
+                    title="Auto-Generated pgveil.yaml Policy Block"
+                    code={discoveryReport.generated_yaml}
+                    copied={copiedSnippet === 'discover_yaml'}
+                    onCopy={() => copyText('discover_yaml', discoveryReport.generated_yaml)}
+                  />
+                  {discoveryReport.recommended_denied_tables && discoveryReport.recommended_denied_tables.length > 0 && (
+                    <div className="rounded-lg bg-rose-500/10 border border-rose-500/30 p-3 text-xs font-mono text-rose-200">
+                      Recommended denied_tables:{' '}
+                      <strong>{discoveryReport.recommended_denied_tables.join(', ')}</strong>
+                    </div>
+                  )}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
         {/* TAB 2: HITL APPROVALS QUEUE */}
         {tab === 'approvals' && (
           <div className="space-y-4">
@@ -1072,7 +1257,25 @@ export default function App() {
                 }
               />
               <CodeBlock
-                title="Claude Desktop / Cursor PostgreSQL MCP Server"
+                title="Native Zero-Dependency MCP Server (Claude Desktop / Cursor)"
+                code={`{
+  "mcpServers": {
+    "pgveil-native": {
+      "command": "pgveil",
+      "args": ["mcp", "--config", "/path/to/pgveil.yaml", "--profile", "ai_agent"]
+    }
+  }
+}`}
+                copied={copiedSnippet === 'mcp_native'}
+                onCopy={() =>
+                  copyText(
+                    'mcp_native',
+                    'pgveil mcp --config configs/pgveil.yaml --profile ai_agent'
+                  )
+                }
+              />
+              <CodeBlock
+                title="Or Wire Proxy Mode with Official Postgres MCP Server"
                 code={`{
   "mcpServers": {
     "postgres-protected": {

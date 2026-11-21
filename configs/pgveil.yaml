@@ -12,6 +12,14 @@ server:
     enabled: false
     cert_file: ""
     key_file: ""
+  upstream_tls:
+    enabled: false
+    insecure_skip_verify: false
+    server_name: ""
+
+notifications:
+  # Optional Slack / Teams / Discord webhook URL for live HITL prompts and CRITICAL blocks.
+  webhook_url: ""
 
 security:
   # HMAC secret for deterministic JOIN-preserving pseudonymization (`hash` / `fake` strategies).
@@ -48,6 +56,7 @@ default_profile: "analyst"
 profiles:
   - name: "ai_agent"
     description: "Zero-trust sandbox for AI SQL agents, Claude Code, Cursor, and MCP Postgres servers."
+    mode: "enforce" # Set to "audit" for non-blocking shadow rollout (emits WOULD_BLOCK telemetry)
     match:
       application_names:
         - "ai_agent"
@@ -65,6 +74,8 @@ profiles:
       block_write_without_where: true
       block_dangerous_functions: true
       block_system_catalogs: true
+      block_pii_inference: true # Blocks side-channel oracle probes (WHERE tckn LIKE '100%', SUBSTRING(iban,1,6), ORDER BY ssn)
+      protected_columns: ["tckn", "national_id", "ssn", "iban", "card_number", "credit_card", "secret_value", "password_hash"]
       require_hitl_statements: ["UPDATE", "DELETE", "INSERT"]
       hitl_mode: "hold" # "hold" pauses query live until human approves/denies; "reject" fails immediately with approval ID
       hitl_timeout: "60s"
@@ -76,6 +87,10 @@ profiles:
       max_rows: 25
       max_rows_action: "truncate" # "truncate" caps DataRows + emits Notice; "block" aborts with SQLSTATE 42501
       block_select_star_on_pii_tables: false
+      rate_limit:
+        max_queries_per_minute: 0 # Set e.g. 120 in production to cap runaway AI agent request volume
+        loop_threshold: 0         # Set e.g. 15 to break stuck identical-query agent loops
+        loop_window: "15s"
     masking:
       enabled: true
       auto_detect_pii: true

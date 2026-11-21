@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/duhanguler/pgveil/internal/discover"
 	"github.com/duhanguler/pgveil/internal/events"
 	"github.com/duhanguler/pgveil/internal/firewall"
 	"github.com/duhanguler/pgveil/internal/hitl"
@@ -74,6 +75,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/v1/policies/yaml", s.handleReloadPolicies)
 	mux.HandleFunc("POST /api/v1/inspect", s.handleInspect)
 	mux.HandleFunc("POST /api/v1/playground/query", s.handlePlaygroundQuery)
+	mux.HandleFunc("POST /api/v1/discover", s.handleDiscover)
 
 	// Human-in-the-Loop (HITL) Approvals
 	mux.HandleFunc("GET /api/v1/approvals", s.handleListApprovals)
@@ -183,6 +185,9 @@ func (s *Server) handleGetPolicies(w http.ResponseWriter, r *http.Request) {
 			"gdpr":    pii.PackEntities[pii.PackGDPR],
 			"pci-dss": pii.PackEntities[pii.PackPCIDSS],
 			"hipaa":   pii.PackEntities[pii.PackHIPAA],
+			"lgpd":    pii.PackEntities[pii.PackLGPD],
+			"pipeda":  pii.PackEntities[pii.PackPIPEDA],
+			"uk-gdpr": pii.PackEntities[pii.PackUKGDPR],
 			"secrets": pii.PackEntities[pii.PackSecrets],
 		},
 		"yaml": rawYAML,
@@ -414,6 +419,37 @@ func (s *Server) handleResolveApproval(approve bool) http.HandlerFunc {
 		}
 		writeJSON(w, http.StatusOK, req)
 	}
+}
+
+func (s *Server) handleDiscover(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		SampleRows int `json:"sample_rows"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+	if req.SampleRows <= 0 {
+		req.SampleRows = 50
+	}
+	cfg := s.policyMgr.Config()
+	sslMode := "disable"
+	if cfg.Server.UpstreamTLS.Enabled {
+		sslMode = "require"
+	}
+	dsn := fmt.Sprintf("postgres://%s:%s@%s/%s?sslmode=%s&application_name=pgveil-discover",
+		cfg.Server.UpstreamUser,
+		cfg.Server.UpstreamPassword,
+		cfg.Server.UpstreamAddr,
+		cfg.Server.UpstreamDatabase,
+		sslMode,
+	)
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+
+	report, err := discover.Scan(ctx, dsn, req.SampleRows, cfg.Security.MaskingSecret)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, report)
 }
 
 func (s *Server) spaHandler(root fs.FS) http.Handler {

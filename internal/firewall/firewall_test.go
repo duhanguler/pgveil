@@ -16,6 +16,8 @@ func testAIAgentProfile() *policy.RoleProfile {
 			BlockWriteWithoutWhere:  true,
 			BlockDangerousFunctions: true,
 			BlockSystemCatalogs:     true,
+			BlockPIIInference:       true,
+			ProtectedColumns:        []string{"tckn", "ssn", "iban", "card_number", "secret_value"},
 			RequireHITLStatements:   []string{"UPDATE", "DELETE", "INSERT"},
 			HITLMode:                "hold",
 			DeniedTables:            []string{"api_secrets", "pg_shadow", "pg_authid"},
@@ -147,6 +149,36 @@ func TestASTFirewallEnforcements(t *testing.T) {
 			sql:        "BEGIN",
 			wantAction: ActionAllow,
 			wantRule:   "policy_allow",
+		},
+		{
+			name:       "PII side-channel WHERE LIKE probe blocked",
+			sql:        "SELECT id, full_name FROM customers WHERE tckn LIKE '100000%'",
+			wantAction: ActionBlock,
+			wantRule:   "pii_side_channel_inference",
+		},
+		{
+			name:       "PII side-channel SUBSTRING alias bypass blocked",
+			sql:        "SELECT id, SUBSTRING(iban, 1, 8) AS prefix FROM customers",
+			wantAction: ActionBlock,
+			wantRule:   "pii_side_channel_inference",
+		},
+		{
+			name:       "PII side-channel ORDER BY masked column blocked",
+			sql:        "SELECT id, city FROM customers ORDER BY tckn ASC",
+			wantAction: ActionBlock,
+			wantRule:   "pii_side_channel_inference",
+		},
+		{
+			name:       "PII side-channel string concat alias evasion blocked",
+			sql:        "SELECT id, tckn || '' AS raw_id FROM customers",
+			wantAction: ActionBlock,
+			wantRule:   "pii_side_channel_inference",
+		},
+		{
+			name:       "PII side-channel CASE oracle probe blocked",
+			sql:        "SELECT id, CASE WHEN ssn = '123-45-6789' THEN 1 ELSE 0 END FROM customers",
+			wantAction: ActionBlock,
+			wantRule:   "pii_side_channel_inference",
 		},
 	}
 

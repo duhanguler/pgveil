@@ -2,14 +2,17 @@ package proxy
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -20,6 +23,7 @@ import (
 	"github.com/duhanguler/pgveil/internal/pgwire"
 	"github.com/duhanguler/pgveil/internal/pii"
 	"github.com/duhanguler/pgveil/internal/policy"
+	"github.com/duhanguler/pgveil/internal/ratelimit"
 	"github.com/duhanguler/pgveil/internal/telemetry"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
@@ -32,6 +36,7 @@ type Server struct {
 	eventBus  *events.Bus
 	metrics   *telemetry.Metrics
 	tracer    trace.Tracer
+	limiter   *ratelimit.Limiter
 	tlsConfig *tls.Config
 
 	mu       sync.Mutex
@@ -53,6 +58,7 @@ func NewServer(
 		eventBus:  eventBus,
 		metrics:   metrics,
 		tracer:    tracer,
+		limiter:   ratelimit.NewLimiter(),
 	}
 	cfg := policyMgr.Config()
 	if cfg.Server.TLS.Enabled && cfg.Server.TLS.CertFile != "" && cfg.Server.TLS.KeyFile != "" {
@@ -127,6 +133,7 @@ type sessionMeta struct {
 	appName    string
 	txStatus   byte
 	prepStmts  map[string]string
+	stmtFields map[string][]pgwire.FieldDescription
 }
 
 type wireMsg struct {
@@ -169,18 +176,18 @@ func (s *Server) handleConnection(ctx context.Context, clientConn net.Conn) {
 		appName:    startup.Params["application_name"],
 		txStatus:   'I',
 		prepStmts:  make(map[string]string),
+		stmtFields: make(map[string][]pgwire.FieldDescription),
 	}
 	if meta.database == "" {
 		meta.database = meta.dbUser
 	}
 
-	// 2. Dial upstream PostgreSQL server
-	dialer := net.Dialer{Timeout: 5 * time.Second}
-	upstreamConn, err := dialer.DialContext(ctx, "tcp", upstreamAddr)
+	// 2. Dial upstream PostgreSQL server (with optional PostgreSQL wire SSLRequest TLS upgrade for RDS/Cloud SQL/Neon)
+	upstreamConn, err := s.dialUpstream(ctx, s.policyMgr.Config().Server)
 	if err != nil {
 		slog.Error("upstream PostgreSQL unreachable", "upstream", upstreamAddr, "err", err)
 		_ = pgwire.WriteMessage(clientConn, pgwire.MsgErrorResponse,
-			pgwire.BuildErrorResponse("FATAL", "08006", "pgveil cannot reach upstream PostgreSQL", err.Error(), "Verify upstream_addr in pgveil.yaml"))
+			pgwire.BuildErrorResponse("FATAL", "08006", "pgveil cannot reach upstream PostgreSQL", err.Error(), "Verify upstream_addr / upstream_tls in pgveil.yaml"))
 		return
 	}
 	defer upstreamConn.Close()
@@ -346,18 +353,38 @@ func (s *Server) handleSimpleQuery(
 	dec := firewall.Evaluate(sql, profile)
 	proxyOverhead := time.Since(astStart)
 
+	// Per-profile QPM rate limiter & runaway AI-agent loop circuit breaker
+	if rl := s.checkRateLimit(meta, profile, dec.Fingerprint); !rl.Allowed {
+		dec.Rule = rl.Rule
+		dec.Reason = rl.Reason
+		dec.RiskLevel = "HIGH"
+		if !profile.IsAuditOnly() {
+			s.recordAndEmitBlocked(span, meta, profile, sql, dec, "BLOCKED", proxyOverhead)
+			return s.sendBlockedErrorCode(clientW, meta.txStatus, "53300", rl.Reason, fmt.Sprintf("rule=%s profile=%s", rl.Rule, profile.Name), "Slow down query frequency or break agent retry loop")
+		}
+		s.recordAndEmitBlocked(span, meta, profile, sql, dec, "WOULD_BLOCK", proxyOverhead)
+	}
+
 	hitlOutcome := ""
 	switch dec.Action {
 	case firewall.ActionBlock:
-		s.recordAndEmitBlocked(span, meta, profile, sql, dec, "BLOCKED", proxyOverhead)
-		return s.sendBlockedError(clientW, meta.txStatus, dec.Reason, fmt.Sprintf("rule=%s profile=%s", dec.Rule, profile.Name), "Blocked by pgveil AST SQL Firewall")
+		if profile.IsAuditOnly() {
+			hitlOutcome = "WOULD_BLOCK"
+		} else {
+			s.recordAndEmitBlocked(span, meta, profile, sql, dec, "BLOCKED", proxyOverhead)
+			return s.sendBlockedError(clientW, meta.txStatus, dec.Reason, fmt.Sprintf("rule=%s profile=%s", dec.Rule, profile.Name), "Blocked by pgveil AST SQL Firewall")
+		}
 
 	case firewall.ActionRequireHITL:
-		approved, outcome, detail := s.handleHITL(spanCtx, meta, profile, sql, dec)
-		hitlOutcome = outcome
-		if !approved {
-			s.recordAndEmitBlocked(span, meta, profile, sql, dec, outcome, proxyOverhead)
-			return s.sendBlockedError(clientW, meta.txStatus, detail, fmt.Sprintf("rule=%s profile=%s status=%s", dec.Rule, profile.Name, outcome), "Approve pending query in the pgveil Web Console")
+		if profile.IsAuditOnly() {
+			hitlOutcome = "WOULD_HITL"
+		} else {
+			approved, outcome, detail := s.handleHITL(spanCtx, meta, profile, sql, dec)
+			hitlOutcome = outcome
+			if !approved {
+				s.recordAndEmitBlocked(span, meta, profile, sql, dec, outcome, proxyOverhead)
+				return s.sendBlockedError(clientW, meta.txStatus, detail, fmt.Sprintf("rule=%s profile=%s status=%s", dec.Rule, profile.Name, outcome), "Approve pending query in the pgveil Web Console")
+			}
 		}
 	}
 
@@ -366,7 +393,7 @@ func (s *Server) handleSimpleQuery(
 	if err := pgwire.WriteMessage(upstreamW, pgwire.MsgQuery, rawPayload); err != nil {
 		return err
 	}
-	return s.relayResponseCycle(span, clientW, upstreamR, meta, profile, sql, dec, hitlOutcome, proxyOverhead, upstreamStart)
+	return s.relayResponseCycle(span, clientW, upstreamR, meta, profile, sql, "", dec, hitlOutcome, proxyOverhead, upstreamStart)
 }
 
 func (s *Server) handleExtendedBatch(
@@ -381,9 +408,10 @@ func (s *Server) handleExtendedBatch(
 	spanCtx, span := s.startSpan(ctx, "pgveil.extended_query", meta, profile)
 	defer span.End()
 
-	// Inspect Parse / Bind statements in this pipeline batch
+	// Inspect Parse / Bind / Describe statements in this pipeline batch
 	var primarySQL string
 	var primaryDec firewall.Decision
+	var activeStmtName string
 	var proxyOverhead time.Duration
 	hasQuery := false
 	hasSync := false
@@ -399,18 +427,25 @@ func (s *Server) handleExtendedBatch(
 				continue
 			}
 			meta.prepStmts[stmtName] = query
+			delete(meta.stmtFields, stmtName)
+			activeStmtName = stmtName
 			t0 := time.Now()
 			dec := firewall.Evaluate(query, profile)
 			proxyOverhead += time.Since(t0)
 			primarySQL = query
 			primaryDec = dec
 			hasQuery = true
+		case pgwire.MsgDescribe:
+			if len(m.payload) >= 2 && m.payload[0] == 'S' {
+				activeStmtName = pgwire.ParseSimpleQuery(m.payload[1:])
+			}
 		case pgwire.MsgBind:
-			_, stmtName, rewritten, err := pgwire.RewriteBindResultFormatsToText(m.payload)
+			_, stmtName, _, err := pgwire.RewriteBindResultFormatsToText(m.payload)
 			if err == nil {
-				if profile.Masking.Enabled {
-					m.payload = rewritten
-				}
+				// Preserve exact client-requested Bind format codes so strict extended-protocol drivers
+				// (pgx/v5, psycopg3, JDBC) keep native binary framing for int4/uuid/timestamp while
+				// pgveil masks UTF-8 string OIDs seamlessly in both text and binary wire formats.
+				activeStmtName = stmtName
 				if !hasQuery {
 					if cachedSQL, ok := meta.prepStmts[stmtName]; ok && cachedSQL != "" {
 						t0 := time.Now()
@@ -426,23 +461,42 @@ func (s *Server) handleExtendedBatch(
 			if len(m.payload) >= 2 && m.payload[0] == 'S' {
 				name := pgwire.ParseSimpleQuery(m.payload[1:])
 				delete(meta.prepStmts, name)
+				delete(meta.stmtFields, name)
 			}
 		}
 	}
 
 	hitlOutcome := ""
 	if hasQuery {
+		if rl := s.checkRateLimit(meta, profile, primaryDec.Fingerprint); !rl.Allowed {
+			primaryDec.Rule = rl.Rule
+			primaryDec.Reason = rl.Reason
+			primaryDec.RiskLevel = "HIGH"
+			if !profile.IsAuditOnly() {
+				s.recordAndEmitBlocked(span, meta, profile, primarySQL, primaryDec, "BLOCKED", proxyOverhead)
+				return s.sendBlockedErrorCode(clientW, meta.txStatus, "53300", rl.Reason, fmt.Sprintf("rule=%s profile=%s", rl.Rule, profile.Name), "Slow down query frequency or break agent retry loop")
+			}
+			hitlOutcome = "WOULD_BLOCK"
+		}
 		switch primaryDec.Action {
 		case firewall.ActionBlock:
-			s.recordAndEmitBlocked(span, meta, profile, primarySQL, primaryDec, "BLOCKED", proxyOverhead)
-			return s.sendBlockedError(clientW, meta.txStatus, primaryDec.Reason, fmt.Sprintf("rule=%s profile=%s", primaryDec.Rule, profile.Name), "Blocked by pgveil AST SQL Firewall")
+			if profile.IsAuditOnly() {
+				hitlOutcome = "WOULD_BLOCK"
+			} else {
+				s.recordAndEmitBlocked(span, meta, profile, primarySQL, primaryDec, "BLOCKED", proxyOverhead)
+				return s.sendBlockedError(clientW, meta.txStatus, primaryDec.Reason, fmt.Sprintf("rule=%s profile=%s", primaryDec.Rule, profile.Name), "Blocked by pgveil AST SQL Firewall")
+			}
 
 		case firewall.ActionRequireHITL:
-			approved, outcome, detail := s.handleHITL(spanCtx, meta, profile, primarySQL, primaryDec)
-			hitlOutcome = outcome
-			if !approved {
-				s.recordAndEmitBlocked(span, meta, profile, primarySQL, primaryDec, outcome, proxyOverhead)
-				return s.sendBlockedError(clientW, meta.txStatus, detail, fmt.Sprintf("rule=%s profile=%s status=%s", primaryDec.Rule, profile.Name, outcome), "Approve pending query in the pgveil Web Console")
+			if profile.IsAuditOnly() {
+				hitlOutcome = "WOULD_HITL"
+			} else {
+				approved, outcome, detail := s.handleHITL(spanCtx, meta, profile, primarySQL, primaryDec)
+				hitlOutcome = outcome
+				if !approved {
+					s.recordAndEmitBlocked(span, meta, profile, primarySQL, primaryDec, outcome, proxyOverhead)
+					return s.sendBlockedError(clientW, meta.txStatus, detail, fmt.Sprintf("rule=%s profile=%s status=%s", primaryDec.Rule, profile.Name, outcome), "Approve pending query in the pgveil Web Console")
+				}
 			}
 		}
 	}
@@ -460,7 +514,7 @@ func (s *Server) handleExtendedBatch(
 	if !hasQuery {
 		primaryDec = firewall.Decision{Action: firewall.ActionAllow, StatementType: "EXTENDED", RiskLevel: "LOW", Rule: "policy_allow"}
 	}
-	return s.relayResponseCycle(span, clientW, upstreamR, meta, profile, primarySQL, primaryDec, hitlOutcome, proxyOverhead, upstreamStart)
+	return s.relayResponseCycle(span, clientW, upstreamR, meta, profile, primarySQL, activeStmtName, primaryDec, hitlOutcome, proxyOverhead, upstreamStart)
 }
 
 func (s *Server) relayUntilFlush(clientW io.Writer, upstreamR io.Reader) error {
@@ -471,6 +525,17 @@ func (s *Server) relayUntilFlush(clientW io.Writer, upstreamR io.Reader) error {
 	return pgwire.WriteMessage(clientW, mType, payload)
 }
 
+func isUTF8TextOID(oid uint32) bool {
+	// PostgreSQL built-in UTF-8 string OIDs whose binary wire format is identical to raw UTF-8 text:
+	// 18=char, 19=name, 25=text, 114=json, 1042=bpchar, 1043=varchar
+	switch oid {
+	case 18, 19, 25, 114, 1042, 1043:
+		return true
+	default:
+		return false
+	}
+}
+
 func (s *Server) relayResponseCycle(
 	span trace.Span,
 	clientW io.Writer,
@@ -478,6 +543,7 @@ func (s *Server) relayResponseCycle(
 	meta *sessionMeta,
 	profile *policy.RoleProfile,
 	sql string,
+	stmtName string,
 	dec firewall.Decision,
 	hitlOutcome string,
 	proxyOverhead time.Duration,
@@ -493,6 +559,28 @@ func (s *Server) relayResponseCycle(
 	var fields []pgwire.FieldDescription
 	var colStrategies []pii.Strategy
 	anyColRule := false
+
+	initFieldStrategies := func(fds []pgwire.FieldDescription) {
+		fields = fds
+		colStrategies = make([]pii.Strategy, len(fields))
+		anyColRule = false
+		if maskingEnabled {
+			for i, f := range fields {
+				st := profile.ColumnStrategy(f.Name)
+				colStrategies[i] = st
+				if st != "" {
+					anyColRule = true
+				}
+			}
+		}
+	}
+
+	// Pre-populate column descriptors from cached prepared statement (for Extended Query Execute without Describe)
+	if stmtName != "" {
+		if cached, ok := meta.stmtFields[stmtName]; ok && len(cached) > 0 {
+			initFieldStrategies(cached)
+		}
+	}
 
 	rowsReturned := 0
 	rowsDropped := 0
@@ -510,17 +598,9 @@ func (s *Server) relayResponseCycle(
 		switch mType {
 		case pgwire.MsgRowDescription:
 			if parsed, perr := pgwire.ParseRowDescription(payload); perr == nil {
-				fields = parsed
-				colStrategies = make([]pii.Strategy, len(fields))
-				anyColRule = false
-				if maskingEnabled {
-					for i, f := range fields {
-						st := profile.ColumnStrategy(f.Name)
-						colStrategies[i] = st
-						if st != "" {
-							anyColRule = true
-						}
-					}
+				initFieldStrategies(parsed)
+				if stmtName != "" {
+					meta.stmtFields[stmtName] = parsed
 				}
 			}
 			if !budgetBlocked {
@@ -547,7 +627,11 @@ func (s *Server) relayResponseCycle(
 				if perr == nil {
 					changed := false
 					for i := 0; i < len(cols) && i < len(fields); i++ {
-						if cols[i] == nil || len(cols[i]) == 0 || fields[i].FormatCode != 0 {
+						if cols[i] == nil || len(cols[i]) == 0 {
+							continue
+						}
+						// Mask text-format cells OR binary-format cells whose OID has raw UTF-8 wire representation
+						if fields[i].FormatCode != 0 && !isUTF8TextOID(fields[i].DataTypeOID) {
 							continue
 						}
 						rawVal := string(cols[i])
@@ -684,6 +768,7 @@ func (s *Server) handleHITL(
 		"statement", dec.StatementType,
 		"timeout", timeout.String(),
 	)
+	s.fireWebhookAsync(fmt.Sprintf("[pgveil HITL PENDING %s] Profile=%q Statement=%s SQL=%q — Approve in Web Console", req.ID, profile.Name, dec.StatementType, sql))
 
 	status, note := s.hitlMgr.Wait(ctx, req)
 	if s.metrics != nil {
@@ -704,11 +789,89 @@ func (s *Server) handleHITL(
 }
 
 func (s *Server) sendBlockedError(w io.Writer, txStatus byte, msg, detail, hint string) error {
+	return s.sendBlockedErrorCode(w, txStatus, "42501", msg, detail, hint)
+}
+
+func (s *Server) sendBlockedErrorCode(w io.Writer, txStatus byte, sqlState, msg, detail, hint string) error {
 	if err := pgwire.WriteMessage(w, pgwire.MsgErrorResponse,
-		pgwire.BuildErrorResponse("ERROR", "42501", msg, detail, hint)); err != nil {
+		pgwire.BuildErrorResponse("ERROR", sqlState, msg, detail, hint)); err != nil {
 		return err
 	}
 	return pgwire.WriteMessage(w, pgwire.MsgReadyForQuery, pgwire.BuildReadyForQuery(txStatus))
+}
+
+func (s *Server) dialUpstream(ctx context.Context, scfg policy.ServerConfig) (net.Conn, error) {
+	dialer := net.Dialer{Timeout: 5 * time.Second}
+	conn, err := dialer.DialContext(ctx, "tcp", scfg.UpstreamAddr)
+	if err != nil {
+		return nil, err
+	}
+	if !scfg.UpstreamTLS.Enabled {
+		return conn, nil
+	}
+	// Negotiate PostgreSQL Wire Protocol SSLRequest (len=8, code=80877103)
+	var sslReq [8]byte
+	binary.BigEndian.PutUint32(sslReq[0:4], 8)
+	binary.BigEndian.PutUint32(sslReq[4:8], pgwire.SSLRequestCode)
+	if _, err := conn.Write(sslReq[:]); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("write upstream SSLRequest: %w", err)
+	}
+	var resp [1]byte
+	if _, err := io.ReadFull(conn, resp[:]); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("read upstream SSLRequest reply: %w", err)
+	}
+	if resp[0] != 'S' {
+		_ = conn.Close()
+		return nil, errors.New("upstream PostgreSQL server declined TLS (responded 'N')")
+	}
+	serverName := scfg.UpstreamTLS.ServerName
+	if serverName == "" {
+		host, _, _ := net.SplitHostPort(scfg.UpstreamAddr)
+		serverName = host
+	}
+	tlsConn := tls.Client(conn, &tls.Config{
+		ServerName:         serverName,
+		InsecureSkipVerify: scfg.UpstreamTLS.InsecureSkipVerify,
+		MinVersion:         tls.VersionTLS12,
+	})
+	if err := tlsConn.HandshakeContext(ctx); err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("upstream TLS handshake: %w", err)
+	}
+	return tlsConn, nil
+}
+
+func (s *Server) checkRateLimit(meta *sessionMeta, profile *policy.RoleProfile, fp string) ratelimit.Decision {
+	if s.limiter == nil || profile == nil {
+		return ratelimit.Decision{Allowed: true}
+	}
+	rl := profile.Firewall.RateLimit
+	if rl.MaxQueriesPerMinute <= 0 && rl.LoopThreshold <= 0 {
+		return ratelimit.Decision{Allowed: true}
+	}
+	host, _, err := net.SplitHostPort(meta.clientAddr)
+	if err != nil {
+		host = meta.clientAddr
+	}
+	key := profile.Name + ":" + host
+	return s.limiter.Check(key, fp, rl.MaxQueriesPerMinute, rl.LoopThreshold, profile.Firewall.LoopWindowDuration())
+}
+
+func (s *Server) fireWebhookAsync(message string) {
+	url := s.policyMgr.Config().Notifications.WebhookURL
+	if url == "" {
+		return
+	}
+	go func() {
+		payload, _ := json.Marshal(map[string]any{"text": message, "content": message})
+		client := &http.Client{Timeout: 3 * time.Second}
+		resp, err := client.Post(url, "application/json", bytes.NewReader(payload))
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+	}()
 }
 
 func (s *Server) recordAndEmitBlocked(
@@ -751,6 +914,9 @@ func (s *Server) recordAndEmitBlocked(
 			TablesAccessed:  dec.Tables,
 			ProxyOverheadUs: proxyOverhead.Microseconds(),
 		})
+	}
+	if dec.RiskLevel == "CRITICAL" && decisionLabel == "BLOCKED" {
+		s.fireWebhookAsync(fmt.Sprintf("[pgveil CRITICAL BLOCK] Profile=%q Rule=%s Reason=%q SQL=%q", profile.Name, dec.Rule, dec.Reason, strings.TrimSpace(sql)))
 	}
 }
 

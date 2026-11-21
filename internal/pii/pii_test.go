@@ -116,6 +116,45 @@ func TestDeterministicHashPreservesJoins(t *testing.T) {
 	}
 }
 
+func TestGlobalCompliancePacksCPF_SIN_NINO(t *testing.T) {
+	// Valid synthetic Brazilian CPF (529.982.247-25 is the classic official test CPF)
+	if !ValidateBRCPF("529.982.247-25") {
+		t.Fatal("expected 529.982.247-25 to be valid CPF")
+	}
+	if ValidateBRCPF("111.111.111-11") || ValidateBRCPF("529.982.247-26") {
+		t.Fatal("expected invalid CPF to be rejected")
+	}
+	// Valid synthetic Canadian SIN (046-454-286 is invalid leading 0; 130-692-544 passes Luhn)
+	if !ValidateCASIN("130-692-544") {
+		t.Fatal("expected 130-692-544 to pass Canadian SIN Luhn")
+	}
+	if ValidateCASIN("130-692-545") || ValidateCASIN("800-000-002") {
+		t.Fatal("expected invalid SIN to be rejected")
+	}
+	// Valid UK NINO vs HMRC disallowed prefix GB/ZZ
+	if !ValidateUKNINO("QQ 12 34 56 C") {
+		// Q is disallowed; AA 12 34 56 C is valid!
+		if !ValidateUKNINO("AA 12 34 56 C") {
+			t.Fatal("expected AA 12 34 56 C to be valid UK NINO")
+		}
+	}
+	if ValidateUKNINO("GB 12 34 56 C") || ValidateUKNINO("ZZ 12 34 56 A") {
+		t.Fatal("expected HMRC-disallowed UK NINO prefix to be rejected")
+	}
+
+	m := NewMasker("global-key")
+	enabled := ResolveEnabledEntities([]string{"lgpd", "pipeda", "uk-gdpr"})
+	out, counts := m.MaskText("CPF 529.982.247-25 SIN 130-692-544 NINO AA 12 34 56 C", enabled)
+	for _, raw := range []string{"529.982.247-25", "130-692-544", "AA 12 34 56 C"} {
+		if strings.Contains(out, raw) {
+			t.Fatalf("leaked %q in %q", raw, out)
+		}
+	}
+	if counts[string(EntityBRCPF)] != 1 || counts[string(EntityCASIN)] != 1 || counts[string(EntityUKNINO)] != 1 {
+		t.Fatalf("unexpected global counts: %+v", counts)
+	}
+}
+
 func BenchmarkMaskFreeTextWithPII(b *testing.B) {
 	m := NewMasker("bench-key")
 	enabled := ResolveEnabledEntities([]string{"kvkk", "gdpr", "pci-dss", "hipaa", "secrets"})

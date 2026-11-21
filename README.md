@@ -4,19 +4,27 @@
 
 <p align="center">
   <a href="https://github.com/duhanguler/pgveil/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/duhanguler/pgveil/ci.yml?branch=main&style=flat-square&label=CI" alt="CI" /></a>
-  <a href="https://github.com/duhanguler/pgveil/releases"><img src="https://img.shields.io/badge/Release-v0.2.0-10b981?style=flat-square" alt="v0.2.0" /></a>
+  <a href="https://github.com/duhanguler/pgveil/releases"><img src="https://img.shields.io/badge/Release-v0.3.0-18181b?style=flat-square" alt="v0.3.0" /></a>
+  <a href="https://github.com/duhanguler/homebrew-tap"><img src="https://img.shields.io/badge/Homebrew-duhanguler%2Ftap%2Fpgveil-18181b?style=flat-square&logo=homebrew&logoColor=white" alt="Homebrew Tap" /></a>
   <img src="https://img.shields.io/badge/Go-1.26%2B-00ADD8?style=flat-square&logo=go&logoColor=white" alt="Go 1.26+" />
   <img src="https://img.shields.io/badge/PostgreSQL-14--17%20Wire%20v3-336791?style=flat-square&logo=postgresql&logoColor=white" alt="PostgreSQL Wire v3" />
-  <img src="https://img.shields.io/badge/AST-libpg__query%2017-10b981?style=flat-square" alt="PostgreSQL 17 AST" />
-  <img src="https://img.shields.io/badge/Compliance-8%20Global%20Packs-0ea5e9?style=flat-square" alt="8 Compliance Packs" />
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-blue?style=flat-square" alt="Apache 2.0 License" /></a>
+  <img src="https://img.shields.io/badge/AST-libpg__query%2017-18181b?style=flat-square" alt="PostgreSQL 17 AST" />
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-18181b?style=flat-square" alt="Apache 2.0 License" /></a>
 </p>
 
 # pgveil
 
-**Zero-trust PostgreSQL Wire Protocol v3 proxy & native MCP server in Go** — dynamic wire-speed PII masking (**8 compliance packs: GDPR, KVKK, PCI-DSS, HIPAA, LGPD, PIPEDA, UK-GDPR, Secrets**), real **PostgreSQL 17 AST SQL firewall**, **AST side-channel PII oracle protection**, **automatic live schema PII discovery**, **synchronous Human-in-the-Loop (HITL) wire holds**, **runaway AI-agent loop circuit breaker**, **shadow audit-only rollout mode**, async **Kafka audit streaming**, **OpenTelemetry/Prometheus observability**, an **embedded React Web Console**, and a production **Kubernetes Helm chart**.
+**Zero-trust PostgreSQL Wire Protocol v3 proxy & native MCP server in Go** — dynamic wire-speed PII masking (**8 compliance packs: GDPR, KVKK, PCI-DSS, HIPAA, LGPD, PIPEDA, UK-GDPR, Secrets**), real **PostgreSQL 17 AST SQL firewall**, **AST side-channel PII oracle protection**, **automatic live schema PII discovery**, **synchronous Human-in-the-Loop (HITL) wire holds**, **runaway AI-agent loop circuit breaker**, **shadow audit-only rollout mode**, async **Kafka audit streaming**, **OpenTelemetry/Prometheus observability**, an embedded **Precision Database Workbench (`67 KB` gzip, Dark + Light theme)**, and a production **Kubernetes Helm chart**.
 
 Give **AI agents (Claude Code, Cursor, MCP, LangChain)**, BI tools (**Metabase, Superset, DBeaver**), and developers live access to PostgreSQL — **with zero database extensions, zero schema changes, and a 1-line port swap (`5432` → `6432`) or zero-Node.js native `pgveil mcp`**.
+
+```bash
+# Install on macOS (Apple Silicon / Intel) or Linux via Homebrew
+brew install duhanguler/tap/pgveil
+
+# Audit any live PostgreSQL database for exposed PII columns in 2 seconds
+pgveil discover --dsn "postgres://user:pass@localhost:5432/mydb"
+```
 
 ```diff
 - postgres://app:secret@db.internal:5432/prod
@@ -25,9 +33,25 @@ Give **AI agents (Claude Code, Cursor, MCP, LangChain)**, BI tools (**Metabase, 
 
 ---
 
+### Embedded Precision Database Workbench (Dark & Swiss Light)
+
+Built directly into the single Go binary (`67 KB` gzip) — line-numbered SQL & YAML syntax highlighting, live AST pre-flight indicator, `⌘K` Command Palette, right-side Audit Inspector slide-over drawer, live HITL wire-hold countdown, and automatic Dark / Swiss Light theme switching.
+
 <p align="center">
-  <img src="docs/assets/console-playground.png" alt="pgveil Embedded Control Plane & Live Wire SQL Playground" width="100%" />
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/console-playground.png" />
+    <source media="(prefers-color-scheme: light)" srcset="docs/assets/console-light.png" />
+    <img src="docs/assets/console-playground.png" alt="pgveil Embedded Precision Database Workbench — Live Wire SQL Masking & AST Guard" width="100%" />
+  </picture>
 </p>
+
+<details>
+  <summary>Preview Swiss Light &amp; Carbon Dark Workbench side-by-side</summary>
+  <br />
+  <p align="center">
+    <img src="docs/assets/console-light.png" alt="pgveil Workbench — Swiss Light Theme" width="100%" />
+  </p>
+</details>
 
 ---
 
@@ -204,7 +228,22 @@ All benchmarks below were executed locally on **Apple M3 Pro (arm64)** against *
 
 ## Quick Start
 
-### Option 1 — Full Enterprise Stack in 1 Command (Docker Compose)
+### Option 1 — Homebrew (macOS Apple Silicon, Intel & Linux)
+
+```bash
+brew install duhanguler/tap/pgveil
+
+# 1. Scan any existing PostgreSQL database for exposed PII columns & generate policy YAML
+pgveil discover --dsn "postgres://user:pass@localhost:5432/mydb"
+
+# 2. Start the wire proxy (:6432) + embedded Workbench UI (:8088)
+pgveil serve --config configs/pgveil.yaml
+
+# 3. Or run the zero-Node.js native MCP stdio server for Claude Desktop / Cursor
+pgveil mcp --config configs/pgveil.yaml --profile ai_agent
+```
+
+### Option 2 — Full Enterprise Stack in 1 Command (Docker Compose)
 Launches **PostgreSQL 16** (pre-seeded with synthetic e-commerce/fintech PII), **`pgveil` Proxy** (`:6432` wire + `:8088` Web Console), **Redpanda (Kafka)**, **`pgveil-audit-worker`**, **Jaeger**, **Prometheus**, and **Grafana** (pre-provisioned dashboard):
 
 ```bash
@@ -213,12 +252,12 @@ cd pgveil
 docker compose up --build
 ```
 
-- **Embedded Web Console, Playground & PII Discovery:** `http://localhost:8088`
+- **Embedded Precision Workbench & PII Discovery:** `http://localhost:8088`
 - **PostgreSQL Wire Proxy:** `postgres://pgveil:pgveil_dev_password@localhost:6432/pgveil_demo?application_name=claude-mcp`
 - **Grafana Dashboard:** `http://localhost:3000` (`admin` / `pgveil_grafana`)
 - **Jaeger Distributed Traces:** `http://localhost:16686`
 
-### Option 2 — Single Binary CLI (`serve`, `discover`, `mcp`, `scan`, `validate`)
+### Option 3 — Build From Source & CLI (`serve`, `discover`, `mcp`, `scan`, `validate`)
 
 ```bash
 make build
@@ -236,14 +275,14 @@ make build
 ./bin/pgveil scan --sql "SELECT id FROM customers WHERE tckn LIKE '100000%'" --profile ai_agent
 ```
 
-### Option 3 — Connect Claude Desktop / Cursor MCP (Zero Node.js or Wire Mode)
+### Option 4 — Connect Claude Desktop / Cursor MCP (Zero Node.js or Wire Mode)
 Native single-binary MCP ([`examples/mcp-claude/pgveil_native_mcp.json`](examples/mcp-claude/pgveil_native_mcp.json)):
 
 ```json
 {
   "mcpServers": {
     "pgveil-native-postgres": {
-      "command": "/usr/local/bin/pgveil",
+      "command": "/opt/homebrew/bin/pgveil",
       "args": ["mcp", "--config", "/path/to/configs/pgveil.yaml", "--profile", "ai_agent"]
     }
   }
@@ -252,7 +291,7 @@ Native single-binary MCP ([`examples/mcp-claude/pgveil_native_mcp.json`](example
 
 Or wire-proxy mode with the official Postgres MCP server ([`examples/mcp-claude/claude_desktop_config.json`](examples/mcp-claude/claude_desktop_config.json)) and Python `psycopg` agent ([`examples/python-agent/agent_demo.py`](examples/python-agent/agent_demo.py)).
 
-### Option 4 — Production Kubernetes Deployment (Helm)
+### Option 5 — Production Kubernetes Deployment (Helm)
 
 ```bash
 helm lint deploy/helm/pgveil

@@ -74,6 +74,7 @@ export interface ApprovalRequest {
 export interface RoleProfile {
   name: string
   description: string
+  mode?: string
   match: {
     application_names?: string[]
     users?: string[]
@@ -85,12 +86,19 @@ export interface RoleProfile {
     block_write_without_where: boolean
     block_dangerous_functions: boolean
     block_system_catalogs: boolean
+    block_pii_inference?: boolean
+    protected_columns?: string[]
     require_hitl_statements?: string[]
     hitl_mode: string
     hitl_timeout: string
     denied_tables?: string[]
     max_rows: number
     max_rows_action: string
+    rate_limit?: {
+      max_queries_per_minute: number
+      loop_threshold: number
+      loop_window: string
+    }
   }
   masking: {
     enabled: boolean

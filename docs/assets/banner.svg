@@ -1,73 +1,125 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 320" width="1200" height="320">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 300" width="1200" height="300">
   <defs>
-    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#020617"/>
-      <stop offset="55%" stop-color="#0b1224"/>
-      <stop offset="100%" stop-color="#042f2e"/>
-    </linearGradient>
-    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="0%">
-      <stop offset="0%" stop-color="#10b981"/>
-      <stop offset="100%" stop-color="#06b6d4"/>
-    </linearGradient>
-    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
-      <path d="M 32 0 L 0 0 0 32" fill="none" stroke="#1e293b" stroke-width="0.6" opacity="0.45"/>
+    <pattern id="hairline-grid" width="24" height="24" patternUnits="userSpaceOnUse">
+      <path d="M 24 0 L 0 0 0 24" fill="none" stroke="#18181B" stroke-width="0.75"/>
     </pattern>
   </defs>
 
-  <rect width="1200" height="320" rx="18" fill="url(#bg)"/>
-  <rect width="1200" height="320" rx="18" fill="url(#grid)"/>
-  <rect x="1" y="1" width="1198" height="318" rx="17" fill="none" stroke="#1e293b" stroke-width="2"/>
+  <!-- Canvas -->
+  <rect width="1200" height="300" rx="10" fill="#09090B"/>
+  <rect width="1200" height="300" rx="10" fill="url(#hairline-grid)" opacity="0.65"/>
+  <rect x="0.5" y="0.5" width="1199" height="299" rx="10" fill="none" stroke="#23232A" stroke-width="1"/>
 
-  <!-- Shield Emblem -->
-  <g transform="translate(68, 66)">
-    <rect x="0" y="0" width="84" height="84" rx="18" fill="url(#accent)" opacity="0.16" stroke="#10b981" stroke-width="2"/>
-    <path d="M42 16 L66 26 V44 C66 59 55 68 42 73 C29 68 18 59 18 44 V26 Z" fill="none" stroke="url(#accent)" stroke-width="4" stroke-linejoin="round"/>
-    <path d="M32 43 L39 50 L53 35" fill="none" stroke="#34d399" stroke-width="4" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- Left Column: Brand & Value Prop -->
+  <g transform="translate(52, 48)">
+    <!-- Monochrome Geometric Shield -->
+    <rect x="0" y="0" width="44" height="44" rx="8" fill="#111115" stroke="#27272A" stroke-width="1"/>
+    <path d="M22 10 L33 14.5 V23 C33 29.2 28.4 33.6 22 35.5 C15.6 33.6 11 29.2 11 23 V14.5 Z" fill="none" stroke="#FAFAFA" stroke-width="1.9" stroke-linejoin="round"/>
+    <path d="M17.4 22.8 L20.6 26 L27 19.4" fill="none" stroke="#22C55E" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+
+    <!-- Wordmark + Version -->
+    <text x="58" y="34" fill="#FAFAFA" font-family="-apple-system, BlinkMacSystemFont, Inter, Segoe UI, Helvetica, sans-serif" font-size="38" font-weight="700" letter-spacing="-1.2">pgveil</text>
+    <rect x="184" y="10" width="58" height="22" rx="4" fill="#141418" stroke="#27272A" stroke-width="1"/>
+    <text x="213" y="25" text-anchor="middle" fill="#A1A1AA" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, monospace" font-size="11.5" font-weight="500">v0.3.0</text>
+
+    <!-- Subtitle -->
+    <text x="0" y="80" fill="#E4E4E7" font-family="-apple-system, BlinkMacSystemFont, Inter, Segoe UI, sans-serif" font-size="19" font-weight="500" letter-spacing="-0.3">Zero-Trust PostgreSQL Wire-Protocol Proxy</text>
+    <text x="0" y="106" fill="#A1A1AA" font-family="-apple-system, BlinkMacSystemFont, Inter, Segoe UI, sans-serif" font-size="14.5" font-weight="400">Dynamic PII masking, PG17 AST firewall, and live HITL holds for AI agents &amp; MCP.</text>
+
+    <!-- Crisp Wire Architecture Line -->
+    <g transform="translate(0, 134)" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5">
+      <rect x="0" y="0" width="166" height="32" rx="5" fill="#111115" stroke="#27272A"/>
+      <text x="83" y="20" text-anchor="middle" fill="#A1A1AA">MCP · psql · pgx</text>
+
+      <line x1="166" y1="16" x2="196" y2="16" stroke="#3F3F46" stroke-width="1.2"/>
+      <polygon points="199,16 193,12.5 193,19.5" fill="#71717A"/>
+
+      <rect x="201" y="0" width="184" height="32" rx="5" fill="#141418" stroke="#FAFAFA" stroke-width="1"/>
+      <circle cx="217" cy="16" r="3" fill="#22C55E"/>
+      <text x="299" y="20" text-anchor="middle" fill="#FAFAFA" font-weight="600">pgveil :6432</text>
+
+      <line x1="385" y1="16" x2="415" y2="16" stroke="#3F3F46" stroke-width="1.2"/>
+      <polygon points="418,16 412,12.5 412,19.5" fill="#71717A"/>
+
+      <rect x="420" y="0" width="144" height="32" rx="5" fill="#111115" stroke="#27272A"/>
+      <text x="492" y="20" text-anchor="middle" fill="#D4D4D8">PostgreSQL 14–17</text>
+    </g>
+
+    <!-- Bottom Verified Spec Strip -->
+    <g transform="translate(0, 192)" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5">
+      <text x="0" y="14" fill="#FAFAFA" font-weight="600">25,012 TPS</text>
+      <text x="84" y="14" fill="#52525B">·</text>
+      <text x="98" y="14" fill="#A1A1AA">+0.246 ms overhead</text>
+      <text x="242" y="14" fill="#52525B">·</text>
+      <text x="256" y="14" fill="#A1A1AA">8 compliance packs</text>
+      <text x="402" y="14" fill="#52525B">·</text>
+      <text x="416" y="14" fill="#A1A1AA">Single Go binary</text>
+    </g>
   </g>
 
-  <!-- Title & Tagline -->
-  <text x="176" y="114" fill="#f8fafc" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="54" font-weight="800" letter-spacing="-1.5">pgveil</text>
-  <rect x="352" y="80" width="174" height="28" rx="14" fill="#10b981" fill-opacity="0.14" stroke="#10b981" stroke-opacity="0.45"/>
-  <text x="439" y="99" text-anchor="middle" fill="#6ee7b7" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12" font-weight="700">WIRE PROTOCOL v3</text>
+  <!-- Right Column: Precision Wire Inspection Card -->
+  <g transform="translate(658, 36)">
+    <rect x="0" y="0" width="490" height="228" rx="8" fill="#0F0F12" stroke="#23232A" stroke-width="1"/>
+    <!-- Card Top Header Bar -->
+    <line x1="0" y1="34" x2="490" y2="34" stroke="#23232A" stroke-width="1"/>
+    <circle cx="16" cy="17" r="3.5" fill="#27272A"/>
+    <circle cx="29" cy="17" r="3.5" fill="#27272A"/>
+    <circle cx="42" cy="17" r="3.5" fill="#27272A"/>
+    <text x="60" y="21" fill="#A1A1AA" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11">wire :6432 — profile: ai_agent</text>
+    <circle cx="420" cy="17" r="3" fill="#22C55E"/>
+    <text x="429" y="21" fill="#71717A" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="10.5">ENFORCE</text>
 
-  <text x="176" y="152" fill="#cbd5e1" font-family="Inter, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif" font-size="20" font-weight="400">Zero-Trust PostgreSQL Dynamic PII Masking &amp; AI-Agent SQL Firewall Proxy</text>
+    <!-- SQL Query Line 1 (Masked) -->
+    <g transform="translate(16, 54)" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="11.5">
+      <text x="0" y="0" fill="#71717A">1</text>
+      <text x="20" y="0" fill="#93C5FD">SELECT</text>
+      <text x="68" y="0" fill="#E4E4E7">full_name, email, tckn, iban</text>
+      <text x="272" y="0" fill="#93C5FD">FROM</text>
+      <text x="307" y="0" fill="#E4E4E7">customers</text>
+      <text x="378" y="0" fill="#93C5FD">LIMIT</text>
+      <text x="419" y="0" fill="#FCD34D">2;</text>
 
-  <!-- Feature Pills -->
-  <g font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12.5" font-weight="600">
-    <rect x="68" y="192" width="194" height="32" rx="8" fill="#0f172a" stroke="#334155"/>
-    <text x="165" y="213" text-anchor="middle" fill="#34d399">PostgreSQL 17 AST</text>
+      <!-- Wire Masked Result Box -->
+      <rect x="0" y="14" width="458" height="58" rx="4" fill="#09090B" stroke="#1E1E24"/>
+      <line x1="0" y1="34" x2="458" y2="34" stroke="#1E1E24"/>
+      <g font-size="10.5" fill="#71717A">
+        <text x="10" y="28">full_name</text>
+        <text x="134" y="28">email</text>
+        <text x="262" y="28">tckn</text>
+        <text x="352" y="28">iban</text>
+      </g>
+      <g font-size="10.5" fill="#4ADE80">
+        <text x="10" y="50">tok_5351939b7cc5</text>
+        <text x="134" y="50">a***@example.com</text>
+        <text x="262" y="50">100******46</text>
+        <text x="352" y="50">TR33 **** 1326</text>
+      </g>
+      <g font-size="10.5" fill="#4ADE80">
+        <text x="10" y="65">tok_c602dcb1b2f4</text>
+        <text x="134" y="65">m***@acme.io</text>
+        <text x="262" y="65">123******50</text>
+        <text x="352" y="65">DE89 **** 3000</text>
+      </g>
 
-    <rect x="274" y="192" width="234" height="32" rx="8" fill="#0f172a" stroke="#334155"/>
-    <text x="391" y="213" text-anchor="middle" fill="#38bdf8">GDPR · KVKK · PCI · HIPAA</text>
+      <!-- Divider -->
+      <line x1="0" y1="88" x2="458" y2="88" stroke="#1E1E24"/>
 
-    <rect x="520" y="192" width="198" height="32" rx="8" fill="#0f172a" stroke="#334155"/>
-    <text x="619" y="213" text-anchor="middle" fill="#fbbf24">Live HITL Wire Hold</text>
+      <!-- Blocked Oracle Attack -->
+      <text x="0" y="108" fill="#71717A">2</text>
+      <text x="20" y="108" fill="#93C5FD">SELECT</text>
+      <text x="68" y="108" fill="#E4E4E7">id</text>
+      <text x="88" y="108" fill="#93C5FD">FROM</text>
+      <text x="123" y="108" fill="#E4E4E7">customers</text>
+      <text x="193" y="108" fill="#93C5FD">WHERE</text>
+      <text x="235" y="108" fill="#E4E4E7">tckn</text>
+      <text x="270" y="108" fill="#93C5FD">LIKE</text>
+      <text x="304" y="108" fill="#86EFAC">'100000%'</text>
+      <text x="369" y="108" fill="#E4E4E7">;</text>
 
-    <rect x="730" y="192" width="176" height="32" rx="8" fill="#0f172a" stroke="#334155"/>
-    <text x="818" y="213" text-anchor="middle" fill="#c084fc">Kafka + OTel + K8s</text>
-
-    <rect x="918" y="192" width="214" height="32" rx="8" fill="#0f172a" stroke="#334155"/>
-    <text x="1025" y="213" text-anchor="middle" fill="#f8fafc">1-Line Port Swap (:6432)</text>
-  </g>
-
-  <!-- Wire Flow Strip -->
-  <g transform="translate(68, 246)" font-family="ui-monospace, SFMono-Regular, Menlo, monospace" font-size="12">
-    <rect x="0" y="0" width="236" height="42" rx="8" fill="#0f172a" stroke="#1e293b"/>
-    <text x="118" y="25" text-anchor="middle" fill="#94a3b8">Claude MCP · psql · pgx</text>
-
-    <path d="M 244 21 L 288 21" stroke="#10b981" stroke-width="2" stroke-dasharray="4 3"/>
-    <polygon points="292,21 284,16 284,26" fill="#10b981"/>
-
-    <rect x="298" y="0" width="382" height="42" rx="8" fill="#064e3b" fill-opacity="0.45" stroke="#10b981" stroke-width="1.5"/>
-    <text x="489" y="25" text-anchor="middle" fill="#6ee7b7" font-weight="700">pgveil (:6432)  AST Guard + Wire Masker</text>
-
-    <path d="M 688 21 L 732 21" stroke="#06b6d4" stroke-width="2" stroke-dasharray="4 3"/>
-    <polygon points="736,21 728,16 728,26" fill="#06b6d4"/>
-
-    <rect x="742" y="0" width="164" height="42" rx="8" fill="#0f172a" stroke="#1e293b"/>
-    <text x="824" y="25" text-anchor="middle" fill="#e2e8f0">PostgreSQL 14–17</text>
-
-    <rect x="920" y="0" width="144" height="42" rx="8" fill="#1e1b4b" fill-opacity="0.7" stroke="#6366f1"/>
-    <text x="992" y="25" text-anchor="middle" fill="#a5b4fc">Kafka + OTel</text>
+      <rect x="0" y="120" width="458" height="38" rx="4" fill="#1F1215" stroke="#3F1D23"/>
+      <rect x="0" y="120" width="3" height="38" rx="1.5" fill="#EF4444"/>
+      <text x="12" y="136" fill="#F87171" font-size="10.5" font-weight="600">BLOCKED · SQLSTATE 42501 · pii_side_channel_inference</text>
+      <text x="12" y="151" fill="#A1A1AA" font-size="10">AST predicate probe on protected PII column "tckn" denied</text>
+    </g>
   </g>
 </svg>

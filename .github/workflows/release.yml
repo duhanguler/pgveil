@@ -52,3 +52,51 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository }}-audit-worker:${{ github.ref_name }}
             ghcr.io/${{ github.repository }}-audit-worker:latest
+
+  release-macos:
+    needs: release
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: cd web && npm ci && npm run build
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build macOS arm64 & amd64 CGO binaries
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          COMMIT="$(git rev-parse --short HEAD)"
+          mkdir -p dist/darwin_arm64 dist/darwin_amd64
+
+          CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 \
+            go build -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \
+            -o dist/darwin_arm64/pgveil ./cmd/pgveil
+          cp README.md LICENSE dist/darwin_arm64/
+          tar -czf "dist/pgveil_${VERSION}_darwin_arm64.tar.gz" -C dist/darwin_arm64 pgveil README.md LICENSE
+
+          CGO_ENABLED=1 GOOS=darwin GOARCH=amd64 CGO_CFLAGS="-arch x86_64" CGO_LDFLAGS="-arch x86_64" \
+            go build -ldflags="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT}" \
+            -o dist/darwin_amd64/pgveil ./cmd/pgveil
+          cp README.md LICENSE dist/darwin_amd64/
+          tar -czf "dist/pgveil_${VERSION}_darwin_amd64.tar.gz" -C dist/darwin_amd64 pgveil README.md LICENSE
+
+          cd dist
+          shasum -a 256 "pgveil_${VERSION}_darwin_arm64.tar.gz" > "pgveil_${VERSION}_darwin_arm64.tar.gz.sha256"
+          shasum -a 256 "pgveil_${VERSION}_darwin_amd64.tar.gz" > "pgveil_${VERSION}_darwin_amd64.tar.gz.sha256"
+          cat *.sha256
+      - name: Upload macOS release archives
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh release upload "${GITHUB_REF_NAME}" \
+            "dist/pgveil_${VERSION}_darwin_arm64.tar.gz" \
+            "dist/pgveil_${VERSION}_darwin_arm64.tar.gz.sha256" \
+            "dist/pgveil_${VERSION}_darwin_amd64.tar.gz" \
+            "dist/pgveil_${VERSION}_darwin_amd64.tar.gz.sha256" \
+            --clobber

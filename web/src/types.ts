@@ -14,6 +14,8 @@ export interface AuditEvent {
   trace_id?: string
   occurred_at: string
   client_addr: string
+  source?: string
+  auth_subject?: string
   db_user: string
   database_name: string
   application_name?: string
@@ -24,6 +26,9 @@ export interface AuditEvent {
   rls_rewritten?: boolean
   rls_rules_applied?: string[]
   rewritten_sql_preview?: string
+  estimated_cost?: number
+  estimated_rows?: number
+  seq_scan_tables?: string[]
   decision: string
   risk_level: string
   policy_rule: string
@@ -98,6 +103,14 @@ export interface RoleProfile {
     row_filters?: { table: string; predicate: string }[]
     max_rows: number
     max_rows_action: string
+    max_query_duration?: string
+    cost_guard?: {
+      enabled: boolean
+      max_total_cost: number
+      max_estimated_rows: number
+      block_seq_scan_tables?: string[]
+      fail_closed: boolean
+    }
     rate_limit?: {
       max_queries_per_minute: number
       loop_threshold: number
@@ -109,6 +122,20 @@ export interface RoleProfile {
     auto_detect_pii: boolean
     compliance_packs?: string[]
     column_rules?: { column: string; strategy: string }[]
+  }
+}
+
+export interface CostGuardPreview {
+  evaluated: boolean
+  cache_hit: boolean
+  fallback: boolean
+  blocked: boolean
+  rule?: string
+  reason?: string
+  metrics?: {
+    total_cost: number
+    plan_rows: number
+    seq_scan_tables?: string[]
   }
 }
 

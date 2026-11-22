@@ -19,17 +19,22 @@ type AuditEvent struct {
 	EventID            string         `json:"event_id"`
 	TraceID            string         `json:"trace_id,omitempty"`
 	OccurredAt         time.Time      `json:"occurred_at"`
-	ClientAddr         string         `json:"client_addr"`
-	DBUser             string         `json:"db_user"`
-	DatabaseName       string         `json:"database_name"`
-	ApplicationName    string         `json:"application_name,omitempty"`
-	RoleProfile        string         `json:"role_profile"`
-	StatementType      string         `json:"statement_type"`
+	ClientAddr          string         `json:"client_addr"`
+	Source              string         `json:"source,omitempty"` // "wire", "mcp-http", "mcp-stdio"
+	AuthSubject         string         `json:"auth_subject,omitempty"`
+	DBUser              string         `json:"db_user"`
+	DatabaseName        string         `json:"database_name"`
+	ApplicationName     string         `json:"application_name,omitempty"`
+	RoleProfile         string         `json:"role_profile"`
+	StatementType       string         `json:"statement_type"`
 	SQLFingerprint      string         `json:"sql_fingerprint"`
 	RawSQLPreview       string         `json:"raw_sql_preview"`
 	RLSRewritten        bool           `json:"rls_rewritten,omitempty"`
 	RLSRulesApplied     []string       `json:"rls_rules_applied,omitempty"`
 	RewrittenSQLPreview string         `json:"rewritten_sql_preview,omitempty"`
+	EstimatedCost       float64        `json:"estimated_cost,omitempty"`
+	EstimatedRows       int64          `json:"estimated_rows,omitempty"`
+	SeqScanTables       []string       `json:"seq_scan_tables,omitempty"`
 	Decision            string         `json:"decision"` // ALLOW, MASKED, BLOCKED, TRUNCATED, HITL_APPROVED, HITL_DENIED, HITL_EXPIRED
 	RiskLevel          string         `json:"risk_level"`
 	PolicyRule         string         `json:"policy_rule"`

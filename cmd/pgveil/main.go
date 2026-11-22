@@ -30,7 +30,7 @@ import (
 )
 
 var (
-	version = "0.4.0"
+	version = "0.5.0"
 	commit  = "dev"
 )
 
@@ -73,7 +73,7 @@ Usage:
   pgveil init     --dsn postgres://... [--output pgveil.yaml] [--sample-rows 50] [--force]
   pgveil serve    [--config configs/pgveil.yaml] [--log-level info]
   pgveil discover [--dsn postgres://...] [--config configs/pgveil.yaml] [--format table|yaml|json] [--sample-rows 50]
-  pgveil mcp      [--config configs/pgveil.yaml] [--profile ai_agent] [--dsn postgres://...]
+  pgveil mcp      [--config configs/pgveil.yaml] [--profile ai_agent] [--dsn postgres://...] [--http :8090]
   pgveil scan     --sql "SELECT ..." [--profile ai_agent] [--config configs/pgveil.yaml]
   pgveil validate [--config configs/pgveil.yaml]
   pgveil version`)
@@ -130,7 +130,9 @@ func runDemoCtx(ctx context.Context, args []string) error {
 	}
 
 	distFS, _ := webui.DistFS()
-	apiSrv := api.NewServer(policyMgr, hitlMgr, eventBus, wireProxy.Addr, reg, distFS, version)
+	apiSrv := api.NewServer(policyMgr, hitlMgr, eventBus, wireProxy.Addr, reg, distFS, version).
+		AttachRuntime(wireProxy.CostRunner(), wireProxy.ChatOps(), metrics)
+	defer apiSrv.Close()
 	httpSrv := &http.Server{
 		Addr:              cfg.Server.AdminAddr,
 		Handler:           apiSrv.Handler(),
@@ -161,20 +163,22 @@ func runDemoCtx(ctx context.Context, args []string) error {
 pgveil v%s — Interactive Zero-Config Sandbox (No Docker / No External PostgreSQL)
 ────────────────────────────────────────────────────────────────────────────────
   Web Workbench:   %s
+  Streamable MCP:  %s/mcp  (Bearer token: pgv_demo_istanbul_tenant -> city='Istanbul')
   Wire Proxy:      %s  (backed by embedded PG16 demo engine on %s)
   Seeded Tables:   customers (40) · orders (8) · payments (5) · support_tickets (4) · api_secrets (3)
 
 Try live from another terminal:
-  # 1) AI-Agent masked PII + AST firewall:
+  # 1) AI-Agent masked PII + AST firewall + EXPLAIN Cost Guard:
   psql "postgres://pgveil@%s/pgveil_demo?sslmode=disable&application_name=ai_agent" \
        -c "SELECT id, full_name, email, tckn, city FROM customers LIMIT 5;"
 
-  # 2) AST Virtual Row-Level Security (auto-injects city='Istanbul' & currency='TRY'):
-  psql "postgres://pgveil@%s/pgveil_demo?sslmode=disable&application_name=tenant_tr" \
-       -c "SELECT id, full_name, city, tckn FROM customers;"
+  # 2) Remote Streamable HTTP MCP + JWT/Token Claim Virtual RLS ({{jwt.city}}):
+  curl -s %s/mcp -H "Authorization: Bearer pgv_demo_istanbul_tenant" \
+       -H "Content-Type: application/json" \
+       -d '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT id, full_name, city, tckn FROM customers"}}}'
 
 Press Ctrl+C to stop.
-`, version, uiURL, wireHostPort, upstreamAddr, wireHostPort, wireHostPort)
+`, version, uiURL, uiURL, wireHostPort, upstreamAddr, wireHostPort, uiURL)
 
 	select {
 	case <-ctx.Done():
@@ -327,7 +331,9 @@ func runServeCtx(ctx context.Context, args []string) error {
 		slog.Warn("embedded web UI unavailable", "err", err)
 	}
 
-	apiSrv := api.NewServer(policyMgr, hitlMgr, eventBus, wireProxy.Addr, reg, distFS, version)
+	apiSrv := api.NewServer(policyMgr, hitlMgr, eventBus, wireProxy.Addr, reg, distFS, version).
+		AttachRuntime(wireProxy.CostRunner(), wireProxy.ChatOps(), metrics)
+	defer apiSrv.Close()
 	httpSrv := &http.Server{
 		Addr:              cfg.Server.AdminAddr,
 		Handler:           apiSrv.Handler(),
@@ -439,6 +445,7 @@ func runMCPCtx(ctx context.Context, args []string, r io.Reader, w io.Writer) err
 	cfgPath := fs.String("config", "configs/pgveil.yaml", "Path to pgveil YAML configuration file")
 	profileName := fs.String("profile", "ai_agent", "Role profile enforced on MCP tool calls")
 	dsn := fs.String("dsn", "", "Optional PostgreSQL DSN override")
+	httpAddr := fs.String("http", "", "Optional address to serve Streamable HTTP MCP (e.g. :8090) instead of stdio")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -449,6 +456,38 @@ func runMCPCtx(ctx context.Context, args []string, r io.Reader, w io.Writer) err
 	}
 
 	srv := mcpserver.NewServer(mgr, *profileName, *dsn, version)
+	defer srv.Close()
+
+	if strings.TrimSpace(*httpAddr) != "" {
+		mux := http.NewServeMux()
+		mux.Handle("/mcp", srv.HTTPHandler())
+		mux.HandleFunc("GET /healthz", func(hw http.ResponseWriter, _ *http.Request) {
+			hw.Header().Set("Content-Type", "application/json")
+			_, _ = hw.Write([]byte(`{"status":"ok","transport":"streamable-http"}`))
+		})
+		httpSrv := &http.Server{
+			Addr:              *httpAddr,
+			Handler:           mux,
+			ReadHeaderTimeout: 10 * time.Second,
+		}
+		errCh := make(chan error, 1)
+		go func() {
+			slog.Info("pgveil Streamable HTTP MCP server listening", "addr", *httpAddr, "endpoint", "/mcp")
+			if lerr := httpSrv.ListenAndServe(); lerr != nil && lerr != http.ErrServerClosed {
+				errCh <- lerr
+			}
+		}()
+		select {
+		case <-ctx.Done():
+			sctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			_ = httpSrv.Shutdown(sctx)
+			return nil
+		case lerr := <-errCh:
+			return fmt.Errorf("mcp http server error: %w", lerr)
+		}
+	}
+
 	if err := srv.ServeStdio(ctx, r, w); err != nil {
 		return fmt.Errorf("mcp stdio server error: %w", err)
 	}

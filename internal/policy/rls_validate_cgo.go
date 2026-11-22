@@ -5,10 +5,14 @@ package policy
 import (
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 )
+
+var placeholderTokenRe = regexp.MustCompile(`\{\{([^}]*)\}\}`)
+var validJWTClaimKeyRe = regexp.MustCompile(`^[a-zA-Z0-9_.-]+$`)
 
 var dangerousFilterFuncs = map[string]bool{
 	"pg_read_file": true, "pg_read_binary_file": true, "pg_execute_server_program": true,
@@ -30,11 +34,51 @@ func validateRowFilter(rf RowFilterPolicy) error {
 	if strings.IndexByte(pred, 0) >= 0 {
 		return errors.New("predicate contains embedded NUL byte")
 	}
-	sample := pred
-	for _, ph := range []string{"{{db_user}}", "{{database}}", "{{application_name}}", "{{profile}}"} {
-		sample = strings.ReplaceAll(sample, ph, "__pgveil_sample__")
+	for _, m := range placeholderTokenRe.FindAllStringSubmatch(pred, -1) {
+		key := strings.TrimSpace(m[1])
+		switch key {
+		case "db_user", "database", "application_name", "profile":
+		default:
+			if strings.HasPrefix(key, "jwt.") {
+				claim := strings.TrimPrefix(key, "jwt.")
+				if !validJWTClaimKeyRe.MatchString(claim) {
+					return fmt.Errorf("invalid jwt placeholder %q in predicate", m[0])
+				}
+			} else {
+				return fmt.Errorf("unsupported placeholder %q in predicate (use db_user, database, application_name, profile, or jwt.<claim>)", m[0])
+			}
+		}
 	}
-	tree, err := pg_query.Parse("SELECT 1 WHERE " + sample)
+	// Replace placeholders with safe sentinel literals/substrings depending on single-quote state
+	var sb strings.Builder
+	inQuote := false
+	for i := 0; i < len(pred); {
+		if pred[i] == '\'' {
+			sb.WriteByte('\'')
+			if inQuote && i+1 < len(pred) && pred[i+1] == '\'' {
+				sb.WriteByte('\'')
+				i += 2
+				continue
+			}
+			inQuote = !inQuote
+			i++
+			continue
+		}
+		if strings.HasPrefix(pred[i:], "{{") {
+			if end := strings.Index(pred[i:], "}}"); end > 2 {
+				if inQuote {
+					sb.WriteString("__pgveil_sample__")
+				} else {
+					sb.WriteString("'__pgveil_sample__'")
+				}
+				i += end + 2
+				continue
+			}
+		}
+		sb.WriteByte(pred[i])
+		i++
+	}
+	tree, err := pg_query.Parse("SELECT 1 WHERE " + sb.String())
 	if err != nil {
 		return fmt.Errorf("invalid SQL predicate %q: %w", pred, err)
 	}

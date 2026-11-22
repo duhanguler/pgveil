@@ -33,6 +33,22 @@ export const QUERY_PRESETS: QueryPreset[] = [
     hint: 'Select tenant_tr in the left sidebar to see AST Virtual RLS auto-inject c.city = Istanbul AND o.currency = TRY.'
   },
   {
+    id: 'jwt_rls_claims',
+    label: 'JWT Claim RLS (Switch role → tenant_jwt)',
+    shortLabel: 'JWT Claim RLS',
+    category: 'masking',
+    sql: 'SELECT id, full_name, email, city, tckn\nFROM customers\nORDER BY id;',
+    hint: 'Select tenant_jwt and edit JWT claims (e.g. city=Istanbul or clear it to see fail-closed missing-claim block).'
+  },
+  {
+    id: 'cost_guard_bomb',
+    label: 'Cartesian Cost Bomb (EXPLAIN Cost Guard)',
+    shortLabel: 'Cost Bomb',
+    category: 'firewall',
+    sql: 'SELECT c.id, o.order_number, p.amount\nFROM customers c, orders o, payments p;',
+    hint: 'Sideband read-only EXPLAIN (FORMAT JSON) catches unindexed 3-way Cartesian explosion (cost 92,400 > 50,000) before execution.'
+  },
+  {
     id: 'bulk_exfil',
     label: 'Bulk Exfiltration (40 Rows → Cap 25)',
     shortLabel: 'Bulk Cap',

@@ -25,6 +25,7 @@ import { QUERY_PRESETS } from './data/presets'
 import type {
   ApprovalRequest,
   AuditEvent,
+  CostGuardPreview,
   DiscoveryReport,
   FirewallDecision,
   PlaygroundResult,
@@ -97,7 +98,9 @@ export default function App() {
   // Live backend state
   const [summary, setSummary] = useState<Summary | null>(null)
   const [proxyAddr, setProxyAddr] = useState(':6432')
-  const [version, setVersion] = useState('0.4.0')
+  const [version, setVersion] = useState('0.5.0')
+  const [mcpHttpEnabled, setMcpHttpEnabled] = useState(false)
+  const [chatopsConfigured, setChatopsConfigured] = useState(false)
   const [events, setEvents] = useState<AuditEvent[]>([])
   const [approvals, setApprovals] = useState<ApprovalRequest[]>([])
   const [profiles, setProfiles] = useState<RoleProfile[]>([])
@@ -109,10 +112,13 @@ export default function App() {
   // SQL Workbench state
   const [selectedProfile, setSelectedProfile] = useState('ai_agent')
   const [sql, setSql] = useState(QUERY_PRESETS[0].sql)
+  const [jwtClaimsInput, setJwtClaimsInput] = useState('city=Istanbul, tenant_id=tr-ist-01')
   const [running, setRunning] = useState(false)
   const [pgResult, setPgResult] = useState<PlaygroundResult | null>(null)
   const [preflight, setPreflight] = useState<FirewallDecision | null>(null)
   const [preflightRLS, setPreflightRLS] = useState<{ sql: string; rules: string[] } | null>(null)
+  const [preflightCost, setPreflightCost] = useState<CostGuardPreview | null>(null)
+  const [chatopsPreviewURL, setChatopsPreviewURL] = useState<string | null>(null)
 
   // Discovery state
   const [discovering, setDiscovering] = useState(false)
@@ -131,7 +137,7 @@ export default function App() {
   const [policyNotice, setPolicyNotice] = useState<{ ok: boolean; msg: string } | null>(null)
   const [hitlNote, setHitlNote] = useState('')
   const [copiedKey, setCopiedKey] = useState<string | null>(null)
-  const [connectTab, setConnectTab] = useState<'mcp' | 'psql' | 'wire_mcp' | 'python' | 'helm'>('mcp')
+  const [connectTab, setConnectTab] = useState<'remote_mcp' | 'mcp' | 'psql' | 'wire_mcp' | 'python' | 'helm'>('remote_mcp')
 
   const summaryTimerRef = useRef<number | null>(null)
 
@@ -183,11 +189,17 @@ export default function App() {
   const fetchInitialData = useCallback(async () => {
     await fetchSummary()
     try {
-      const [evRes, apRes, polRes] = await Promise.all([
+      const [evRes, apRes, polRes, hlzRes] = await Promise.all([
         fetch('/api/v1/events?limit=150'),
         fetch('/api/v1/approvals'),
-        fetch('/api/v1/policies')
+        fetch('/api/v1/policies'),
+        fetch('/healthz')
       ])
+      if (hlzRes.ok) {
+        const h = await hlzRes.json()
+        setMcpHttpEnabled(Boolean(h.mcp_http_enabled))
+        setChatopsConfigured(Boolean(h.chatops_configured))
+      }
       if (evRes.ok) {
         const d = await evRes.json()
         setEvents(d.events || [])
@@ -254,11 +266,31 @@ export default function App() {
     }
   }, [fetchSummary])
 
-  // Live debounced AST pre-flight check as SQL or profile changes
+  const activeProfileObj = profiles.find((p) => p.name === selectedProfile)
+  const profileNeedsJWT = useMemo(
+    () => Boolean(activeProfileObj?.firewall.row_filters?.some((rf) => rf.predicate.includes('{{jwt.'))),
+    [activeProfileObj]
+  )
+  const parsedJWTClaims = useMemo(() => {
+    if (!profileNeedsJWT) return undefined
+    const out: Record<string, string> = {}
+    for (const part of jwtClaimsInput.split(',')) {
+      const idx = part.indexOf('=')
+      if (idx > 0) {
+        const k = part.slice(0, idx).trim()
+        const v = part.slice(idx + 1).trim()
+        if (k) out[k] = v
+      }
+    }
+    return out
+  }, [profileNeedsJWT, jwtClaimsInput])
+
+  // Live debounced AST pre-flight check as SQL, profile, or JWT claims change
   useEffect(() => {
     if (!sql.trim()) {
       setPreflight(null)
       setPreflightRLS(null)
+      setPreflightCost(null)
       return
     }
     const timer = window.setTimeout(async () => {
@@ -266,7 +298,7 @@ export default function App() {
         const res = await fetch('/api/v1/inspect', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sql, profile: selectedProfile })
+          body: JSON.stringify({ sql, profile: selectedProfile, jwt_claims: parsedJWTClaims })
         })
         if (res.ok) {
           const d = await res.json()
@@ -276,13 +308,14 @@ export default function App() {
           } else {
             setPreflightRLS(null)
           }
+          setPreflightCost(d.cost_guard || null)
         }
       } catch {
         // ignore
       }
     }, 220)
     return () => window.clearTimeout(timer)
-  }, [sql, selectedProfile])
+  }, [sql, selectedProfile, parsedJWTClaims])
 
   const executeSQL = useCallback(
     async (queryToRun?: string) => {
@@ -294,7 +327,7 @@ export default function App() {
         const res = await fetch('/api/v1/playground/query', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ sql: targetSQL, profile: selectedProfile })
+          body: JSON.stringify({ sql: targetSQL, profile: selectedProfile, jwt_claims: parsedJWTClaims })
         })
         const data: PlaygroundResult = await res.json()
         setPgResult(data)
@@ -305,7 +338,7 @@ export default function App() {
         fetchSummary()
       }
     },
-    [sql, running, selectedProfile, fetchSummary]
+    [sql, running, selectedProfile, parsedJWTClaims, fetchSummary]
   )
 
   const runDiscovery = useCallback(async () => {
@@ -376,7 +409,18 @@ export default function App() {
     setTimeout(() => setCopiedKey(null), 1500)
   }
 
-  const activeProfileObj = profiles.find((p) => p.name === selectedProfile)
+  const testChatOpsCard = async () => {
+    try {
+      const res = await fetch('/api/v1/chatops/test', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+      if (res.ok) {
+        const d = await res.json()
+        setChatopsPreviewURL(d.sample_preview_url || null)
+      }
+    } catch {
+      // ignore
+    }
+  }
+
   const cleanPort = proxyAddr.replace('[::]', '')
 
   const filteredEvents = useMemo(() => {
@@ -405,6 +449,22 @@ export default function App() {
   ]
 
   const connectSnippets: Record<typeof connectTab, { title: string; subtitle: string; code: string }> = {
+    remote_mcp: {
+      title: 'Streamable HTTP Remote MCP + JWT → Virtual RLS (2025-03-26 Spec)',
+      subtitle: 'Zero-DB-hold remote MCP endpoint (/mcp) with HS256/RS256/ES256/JWKS auth and typed {{jwt.*}} AST row filters.',
+      code: `curl -s ${window.location.origin}/mcp \\
+  -H "Authorization: Bearer pgv_demo_istanbul_tenant" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "jsonrpc": "2.0",
+    "id": 1,
+    "method": "tools/call",
+    "params": {
+      "name": "query",
+      "arguments": { "sql": "SELECT id, full_name, email, city, tckn FROM customers" }
+    }
+  }'`
+    },
     mcp: {
       title: 'Native Zero-Node.js MCP Server (Claude Desktop / Cursor / Claude Code)',
       subtitle: 'Single Go binary over stdio — automatically hides denied_tables and enforces AST + PII masking.',
@@ -499,6 +559,12 @@ with psycopg.connect(DSN) as conn:
           </span>
           <span className="hidden sm:inline text-xs font-mono truncate" style={{ color: 'var(--ink-2)' }}>
             wire <strong style={{ color: 'var(--ink-1)' }}>{cleanPort}</strong>
+            {mcpHttpEnabled && (
+              <>
+                <span className="mx-1.5" style={{ color: 'var(--border-strong)' }}>·</span>
+                <span style={{ color: 'var(--ok)' }}>/mcp HTTP</span>
+              </>
+            )}
           </span>
         </div>
 
@@ -831,6 +897,22 @@ with psycopg.connect(DSN) as conn:
                           </span>
                         </>
                       )}
+                      {preflightCost?.metrics && (
+                        <>
+                          <span style={{ color: 'var(--border-strong)' }}>·</span>
+                          <span
+                            className="px-1.5 py-0.2 rounded border text-[10.5px]"
+                            style={{
+                              borderColor: preflightCost.blocked ? 'var(--danger-border)' : 'var(--border)',
+                              background: preflightCost.blocked ? 'var(--danger-subtle)' : 'var(--bg-panel)',
+                              color: preflightCost.blocked ? 'var(--danger)' : 'var(--ink-2)'
+                            }}
+                          >
+                            cost: {preflightCost.metrics.total_cost.toFixed(1)} · ~{preflightCost.metrics.plan_rows} rows
+                            {preflightCost.cache_hit ? ' (cached)' : ''}
+                          </span>
+                        </>
+                      )}
                     </>
                   )}
                 </div>
@@ -853,6 +935,39 @@ with psycopg.connect(DSN) as conn:
                   )}
                 </div>
               </div>
+
+              {/* JWT Claim Simulator Bar (shown when active profile binds {{jwt.*}} predicates) */}
+              {profileNeedsJWT && (
+                <div
+                  className="shrink-0 border-b px-3.5 py-1.5 flex items-center justify-between gap-3 flex-wrap text-[11px] font-mono"
+                  style={{ background: 'var(--bg-panel)', borderColor: 'var(--border)' }}
+                >
+                  <div className="flex items-center gap-2 flex-1 min-w-[240px]">
+                    <span className="shrink-0 font-semibold" style={{ color: 'var(--ok)' }}>
+                      JWT Claims →
+                    </span>
+                    <input
+                      value={jwtClaimsInput}
+                      onChange={(e) => setJwtClaimsInput(e.target.value)}
+                      placeholder="city=Istanbul, tenant_id=42 (clear to test fail-closed missing-claim block)"
+                      className="flex-1 bg-transparent border rounded px-2 py-0.5 text-xs focus:outline-none"
+                      style={{ borderColor: 'var(--border)', color: 'var(--ink-1)' }}
+                    />
+                  </div>
+                  <div className="flex items-center gap-1.5">
+                    {['city=Istanbul', 'city=Ankara', ''].map((presetClaim) => (
+                      <button
+                        key={presetClaim || 'empty'}
+                        onClick={() => setJwtClaimsInput(presetClaim)}
+                        className="px-2 py-0.5 rounded border text-[10.5px]"
+                        style={{ borderColor: 'var(--border)', color: presetClaim ? 'var(--ink-2)' : 'var(--danger)' }}
+                      >
+                        {presetClaim || 'Clear (Fail-Closed)'}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {/* Live Virtual RLS Rewritten SQL Preview Strip */}
               {preflightRLS && (
@@ -1298,19 +1413,58 @@ with psycopg.connect(DSN) as conn:
                 style={{ background: 'var(--bg-panel)', borderColor: 'var(--border)' }}
               >
                 <div>
-                  <h1 className="text-sm font-semibold">Human-in-the-Loop Approval Queue</h1>
+                  <div className="flex items-center gap-2">
+                    <h1 className="text-sm font-semibold">Human-in-the-Loop Approval Queue</h1>
+                    <span
+                      className="text-[10.5px] font-mono px-1.5 py-0.5 rounded border"
+                      style={{
+                        borderColor: chatopsConfigured ? 'var(--ok-border)' : 'var(--border)',
+                        color: chatopsConfigured ? 'var(--ok)' : 'var(--ink-3)',
+                        background: chatopsConfigured ? 'var(--ok-subtle)' : 'var(--bg-surface)'
+                      }}
+                    >
+                      {chatopsConfigured ? 'ChatOps Active' : 'Unfurl-Safe Callbacks Ready'}
+                    </span>
+                  </div>
                   <p className="text-[11.5px]" style={{ color: 'var(--ink-3)' }}>
-                    Scoped AI-agent &amp; developer write queries pause synchronously on the wire until reviewed.
+                    Scoped AI-agent wire &amp; HTTP /mcp writes pause with zero DB connections held; supports Slack Block Kit &amp; POST-only HMAC callbacks.
                   </p>
                 </div>
-                <button
-                  onClick={fetchInitialData}
-                  className="h-7 px-2.5 rounded border text-xs flex items-center gap-1.5"
-                  style={{ borderColor: 'var(--border)', color: 'var(--ink-2)' }}
-                >
-                  <RefreshCw className="w-3.5 h-3.5" /> Refresh
-                </button>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={testChatOpsCard}
+                    className="h-7 px-2.5 rounded border text-xs font-mono"
+                    style={{ borderColor: 'var(--border)', color: 'var(--ink-1)', background: 'var(--bg-surface)' }}
+                  >
+                    Preview Signed Card
+                  </button>
+                  <button
+                    onClick={fetchInitialData}
+                    className="h-7 px-2.5 rounded border text-xs flex items-center gap-1.5"
+                    style={{ borderColor: 'var(--border)', color: 'var(--ink-2)' }}
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" /> Refresh
+                  </button>
+                </div>
               </div>
+              {chatopsPreviewURL && (
+                <div
+                  className="shrink-0 border-b px-4 py-2 flex items-center justify-between gap-3 text-xs font-mono"
+                  style={{ background: 'var(--bg-surface)', borderColor: 'var(--border)' }}
+                >
+                  <span className="truncate" style={{ color: 'var(--ink-2)' }}>
+                    Unfurler-safe GET preview URL generated:{' '}
+                    <code style={{ color: 'var(--ok)' }}>{chatopsPreviewURL}</code>
+                  </span>
+                  <button
+                    onClick={() => copyText('chatops-url', chatopsPreviewURL)}
+                    className="px-2 py-0.5 rounded border shrink-0"
+                    style={{ borderColor: 'var(--border)', color: 'var(--ink-1)' }}
+                  >
+                    {copiedKey === 'chatops-url' ? 'Copied' : 'Copy URL'}
+                  </button>
+                </div>
+              )}
 
               <div className="flex-1 overflow-y-auto divide-y" style={{ borderColor: 'var(--border)' }}>
                 {approvals.length === 0 ? (
@@ -1491,6 +1645,14 @@ with psycopg.connect(DSN) as conn:
                                 {ev.statement_type}
                               </td>
                               <td className="px-3 py-1.5 max-w-md truncate" style={{ color: 'var(--ink-1)' }}>
+                                {ev.source && ev.source.startsWith('mcp') && (
+                                  <span
+                                    className="mr-1.5 px-1 py-0 rounded border text-[9.5px]"
+                                    style={{ borderColor: 'var(--ok-border)', color: 'var(--ok)', background: 'var(--ok-subtle)' }}
+                                  >
+                                    MCP
+                                  </span>
+                                )}
                                 {ev.rls_rewritten && (
                                   <span
                                     className="mr-1.5 px-1 py-0 rounded border text-[9.5px]"
@@ -1583,6 +1745,14 @@ with psycopg.connect(DSN) as conn:
                       <DetailKV label="Policy Rule" value={inspectedEvent.policy_rule} span2 />
                       <DetailKV label="Statement" value={inspectedEvent.statement_type} />
                       <DetailKV label="Client" value={inspectedEvent.client_addr} />
+                      {inspectedEvent.auth_subject && <DetailKV label="Auth Subject" value={inspectedEvent.auth_subject} span2 />}
+                      {inspectedEvent.estimated_cost !== undefined && inspectedEvent.estimated_cost > 0 && (
+                        <DetailKV
+                          label="Planner Cost / Est. Rows"
+                          value={`${inspectedEvent.estimated_cost.toFixed(1)} · ~${inspectedEvent.estimated_rows ?? 0} rows`}
+                          span2
+                        />
+                      )}
                       <DetailKV label="Proxy Overhead" value={`${inspectedEvent.proxy_overhead_us} µs`} />
                       <DetailKV label="Upstream PG" value={`${inspectedEvent.upstream_duration_us} µs`} />
                       <DetailKV label="AST Fingerprint" value={inspectedEvent.sql_fingerprint} span2 />
@@ -1734,7 +1904,8 @@ with psycopg.connect(DSN) as conn:
                   <div className="border-b px-2 pt-2 flex items-center justify-between gap-2" style={{ borderColor: 'var(--border)' }}>
                     <div className="flex items-center gap-1 overflow-x-auto">
                       {[
-                        { id: 'mcp', label: 'Native MCP' },
+                        { id: 'remote_mcp', label: 'Remote HTTP MCP' },
+                        { id: 'mcp', label: 'Stdio MCP' },
                         { id: 'psql', label: 'psql Wire' },
                         { id: 'wire_mcp', label: 'Postgres MCP' },
                         { id: 'python', label: 'Python Agent' },

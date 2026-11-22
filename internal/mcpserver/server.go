@@ -7,16 +7,62 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/duhanguler/pgveil/internal/chatops"
+	"github.com/duhanguler/pgveil/internal/events"
 	"github.com/duhanguler/pgveil/internal/firewall"
+	"github.com/duhanguler/pgveil/internal/hitl"
+	"github.com/duhanguler/pgveil/internal/jwtauth"
 	"github.com/duhanguler/pgveil/internal/pii"
 	"github.com/duhanguler/pgveil/internal/policy"
 	"github.com/duhanguler/pgveil/internal/ratelimit"
+	"github.com/duhanguler/pgveil/internal/telemetry"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-const ProtocolVersion = "2024-11-05"
+const (
+	ProtocolVersion           = "2024-11-05"
+	StreamableProtocolVersion = "2025-03-26"
+)
+
+type callerCtxKey struct{}
+
+// CallerIdentity carries authenticated HTTP/JWT caller attributes into MCP tool execution.
+type CallerIdentity struct {
+	Subject     string
+	ProfileName string
+	Claims      map[string]string
+	Source      string
+	ClientAddr  string
+}
+
+func WithCallerIdentity(ctx context.Context, c CallerIdentity) context.Context {
+	return context.WithValue(ctx, callerCtxKey{}, c)
+}
+
+func callerFromContext(ctx context.Context, defaultProfile string) CallerIdentity {
+	if v, ok := ctx.Value(callerCtxKey{}).(CallerIdentity); ok {
+		if v.ProfileName == "" {
+			v.ProfileName = defaultProfile
+		}
+		if v.Subject == "" {
+			v.Subject = "anonymous"
+		}
+		if v.Source == "" {
+			v.Source = "mcp-http"
+		}
+		return v
+	}
+	return CallerIdentity{
+		Subject:     "stdio",
+		ProfileName: defaultProfile,
+		Source:      "mcp-stdio",
+		ClientAddr:  "mcp-stdio",
+	}
+}
 
 // RPCRequest represents an inbound JSON-RPC 2.0 MCP message over stdio.
 type RPCRequest struct {
@@ -47,7 +93,20 @@ type Server struct {
 	profileName string
 	dsn         string
 	limiter     *ratelimit.Limiter
+	costRunner  *firewall.CostRunner
+	hitlMgr     *hitl.Manager
+	eventBus    *events.Bus
+	chatOps     *chatops.Notifier
+	metrics     *telemetry.Metrics
+	verifier    *jwtauth.Verifier
 	version     string
+
+	poolMu  sync.Mutex
+	pool    *pgxpool.Pool
+	poolDSN string
+
+	sessMu   sync.Mutex
+	sessions map[string]*mcpSession
 }
 
 func NewServer(policyMgr *policy.Manager, profileName, dsn, version string) *Server {
@@ -59,8 +118,41 @@ func NewServer(policyMgr *policy.Manager, profileName, dsn, version string) *Ser
 		profileName: profileName,
 		dsn:         dsn,
 		limiter:     ratelimit.NewLimiter(),
+		costRunner:  firewall.NewCostRunner(policyMgr, dsn),
+		verifier:    jwtauth.NewVerifier(policyMgr),
 		version:     version,
+		sessions:    make(map[string]*mcpSession),
 	}
+}
+
+// AttachControlPlane links the MCP server to the live HITL approval coordinator, audit event bus,
+// shared sideband CostRunner, ChatOps notifier, and Prometheus metrics when hosted in `pgveil serve` / `demo`.
+func (s *Server) AttachControlPlane(
+	hitlMgr *hitl.Manager,
+	eventBus *events.Bus,
+	costRunner *firewall.CostRunner,
+	chatOps *chatops.Notifier,
+	metrics *telemetry.Metrics,
+) *Server {
+	s.hitlMgr = hitlMgr
+	s.eventBus = eventBus
+	if costRunner != nil {
+		s.costRunner.Close()
+		s.costRunner = costRunner
+	}
+	s.chatOps = chatOps
+	s.metrics = metrics
+	return s
+}
+
+// Close releases pooled upstream database connections.
+func (s *Server) Close() {
+	s.poolMu.Lock()
+	if s.pool != nil {
+		s.pool.Close()
+		s.pool = nil
+	}
+	s.poolMu.Unlock()
 }
 
 // ServeStdio reads newline-delimited JSON-RPC 2.0 MCP messages from in and writes responses to out.
@@ -103,11 +195,20 @@ func (s *Server) HandleRequest(ctx context.Context, req RPCRequest) *RPCResponse
 	case "ping":
 		return &RPCResponse{JSONRPC: "2.0", ID: req.ID, Result: map[string]any{}}
 	case "initialize":
+		protoVer := ProtocolVersion
+		var initParams struct {
+			ProtocolVersion string `json:"protocolVersion"`
+		}
+		if len(req.Params) > 0 && json.Unmarshal(req.Params, &initParams) == nil {
+			if initParams.ProtocolVersion == StreamableProtocolVersion {
+				protoVer = StreamableProtocolVersion
+			}
+		}
 		return &RPCResponse{
 			JSONRPC: "2.0",
 			ID:      req.ID,
 			Result: map[string]any{
-				"protocolVersion": ProtocolVersion,
+				"protocolVersion": protoVer,
 				"capabilities": map[string]any{
 					"tools": map[string]any{"listChanged": false},
 				},
@@ -200,15 +301,23 @@ func (s *Server) toolDefinitions() []map[string]any {
 	}
 }
 
-func (s *Server) activeProfile() *policy.RoleProfile {
-	if prof, ok := s.policyMgr.GetProfileByName(s.profileName); ok {
+func (s *Server) activeProfileFor(name string) *policy.RoleProfile {
+	if name == "" {
+		name = s.profileName
+	}
+	if prof, ok := s.policyMgr.GetProfileByName(name); ok {
 		return prof
 	}
-	return s.policyMgr.MatchProfile("", s.profileName)
+	return s.policyMgr.MatchProfile("", name)
+}
+
+func (s *Server) activeProfile() *policy.RoleProfile {
+	return s.activeProfileFor(s.profileName)
 }
 
 func (s *Server) callTool(ctx context.Context, name string, args map[string]any) (string, bool) {
-	prof := s.activeProfile()
+	caller := callerFromContext(ctx, s.profileName)
+	prof := s.activeProfileFor(caller.ProfileName)
 	switch name {
 	case "list_tables":
 		return s.toolListTables(ctx, prof)
@@ -217,33 +326,24 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 		return s.toolDescribeTable(ctx, prof, tbl)
 	case "query":
 		sqlStr, _ := args["sql"].(string)
-		return s.toolQuery(ctx, prof, sqlStr)
+		return s.toolQuery(ctx, prof, caller, sqlStr)
 	case "explain_query":
 		sqlStr, _ := args["sql"].(string)
-		trimmed := strings.TrimSpace(sqlStr)
-		if trimmed == "" {
-			return "sql parameter is required", true
+		explainSQL, err := firewall.InspectExplainPlanOnly(sqlStr)
+		if err != nil {
+			return err.Error(), true
 		}
-		upper := strings.ToUpper(trimmed)
-		// Block ANALYZE inside explain_query so this tool NEVER executes or mutates rows
-		if strings.Contains(upper, "ANALYZE") {
-			return "BLOCKED by pgveil: explain_query is plan-only and disallows EXPLAIN ANALYZE", true
-		}
-		if strings.HasPrefix(upper, "EXPLAIN ") || upper == "EXPLAIN" {
-			return s.toolQuery(ctx, prof, trimmed)
-		}
-		return s.toolQuery(ctx, prof, "EXPLAIN "+trimmed)
+		return s.toolQuery(ctx, prof, caller, explainSQL)
 	default:
 		return fmt.Sprintf("unknown tool %q", name), true
 	}
 }
 
 func (s *Server) toolListTables(ctx context.Context, prof *policy.RoleProfile) (string, bool) {
-	conn, err := s.dialDB(ctx)
+	pool, err := s.getPool(ctx)
 	if err != nil {
 		return "database connection error: " + err.Error(), true
 	}
-	defer conn.Close(context.Background())
 
 	denied := make(map[string]bool)
 	for _, t := range prof.Firewall.DeniedTables {
@@ -256,7 +356,7 @@ func (s *Server) toolListTables(ctx context.Context, prof *policy.RoleProfile) (
 		}
 	}
 
-	rows, err := conn.Query(ctx, `
+	rows, err := pool.Query(ctx, `
 		SELECT table_schema, table_name
 		FROM information_schema.tables
 		WHERE table_schema NOT IN ('pg_catalog', 'information_schema')
@@ -331,13 +431,12 @@ func (s *Server) toolDescribeTable(ctx context.Context, prof *policy.RoleProfile
 	if prof.Firewall.BlockSystemCatalogs && (strings.EqualFold(schemaFilter, "pg_catalog") || strings.HasPrefix(lowBare, "pg_")) {
 		return fmt.Sprintf("pgveil policy denied schema inspection of system catalog %q for profile %q", raw, prof.Name), true
 	}
-	conn, err := s.dialDB(ctx)
+	pool, err := s.getPool(ctx)
 	if err != nil {
 		return "database connection error: " + err.Error(), true
 	}
-	defer conn.Close(context.Background())
 
-	rows, err := conn.Query(ctx, `
+	rows, err := pool.Query(ctx, `
 		SELECT column_name, data_type, is_nullable
 		FROM information_schema.columns
 		WHERE lower(table_name) = lower($1)
@@ -374,31 +473,84 @@ func (s *Server) toolDescribeTable(ctx context.Context, prof *policy.RoleProfile
 	return string(out), false
 }
 
-func (s *Server) toolQuery(ctx context.Context, prof *policy.RoleProfile, sqlStr string) (string, bool) {
+func (s *Server) toolQuery(ctx context.Context, prof *policy.RoleProfile, caller CallerIdentity, sqlStr string) (string, bool) {
 	if strings.TrimSpace(sqlStr) == "" {
 		return "sql parameter is required", true
 	}
 
-	// 1. PostgreSQL 17 AST Firewall + PII Side-Channel Guard
+	t0 := time.Now()
+	// 1. PostgreSQL 17 AST Firewall + PII Side-Channel + Timeout GUC Guard
 	dec := firewall.Evaluate(sqlStr, prof)
-	if dec.Action == firewall.ActionBlock {
+	if dec.Action == firewall.ActionBlock && !prof.IsAuditOnly() {
+		s.emitAudit(prof, caller, sqlStr, dec, firewall.RLSResult{}, nil, "BLOCKED", dec.Reason, 0, false, 0, nil, time.Since(t0), 0)
 		return fmt.Sprintf("BLOCKED by pgveil AST Firewall [%s]: %s", dec.Rule, dec.Reason), true
 	}
-	if dec.Action == firewall.ActionRequireHITL {
-		return fmt.Sprintf("APPROVAL REQUIRED [%s]: %s (connect via pgveil wire port 6432 for live HITL holds)", dec.Rule, dec.Reason), true
-	}
 
-	// 2. Per-Profile Rate Limit & Runaway Loop Circuit Breaker
-	rl := s.limiter.Check("mcp:"+prof.Name, dec.Fingerprint,
+	// 2. Tenant/Subject-Isolated Rate Limit & Runaway Loop Circuit Breaker
+	rlKey := "mcp:" + prof.Name + ":" + caller.Subject
+	rl := s.limiter.Check(rlKey, dec.Fingerprint,
 		prof.Firewall.RateLimit.MaxQueriesPerMinute,
 		prof.Firewall.RateLimit.LoopThreshold,
 		prof.Firewall.LoopWindowDuration(),
 	)
-	if !rl.Allowed {
+	if !rl.Allowed && !prof.IsAuditOnly() {
+		dec.Rule = rl.Rule
+		dec.Reason = rl.Reason
+		dec.RiskLevel = "HIGH"
+		s.emitAudit(prof, caller, sqlStr, dec, firewall.RLSResult{}, nil, "BLOCKED", rl.Reason, 0, false, 0, nil, time.Since(t0), 0)
 		return fmt.Sprintf("THROTTLED by pgveil [%s]: %s", rl.Rule, rl.Reason), true
 	}
 
-	// 3. AST-level Virtual Row-Level Security (RLS) predicate injection
+	// 3. Zero-DB-Connection Live Human-in-the-Loop (HITL) Hold
+	hitlDecision := ""
+	if dec.Action == firewall.ActionRequireHITL && !prof.IsAuditOnly() {
+		if s.hitlMgr == nil {
+			return fmt.Sprintf("APPROVAL REQUIRED [%s]: %s (connect via pgveil serve /mcp or wire port 6432 for live HITL holds)", dec.Rule, dec.Reason), true
+		}
+		timeout := prof.HITLTimeoutDuration(60 * time.Second)
+		cfg := s.policyMgr.Config()
+		req, qErr := s.hitlMgr.CreateWithQuota(hitl.ApprovalRequest{
+			ClientAddr:      caller.ClientAddr,
+			DBUser:          cfg.Server.UpstreamUser,
+			Database:        cfg.Server.UpstreamDatabase,
+			ApplicationName: caller.Source + ":" + caller.Subject,
+			RoleProfile:     prof.Name,
+			StatementType:   dec.StatementType,
+			RiskLevel:       dec.RiskLevel,
+			Rule:            dec.Rule,
+			Reason:          dec.Reason,
+			Tables:          dec.Tables,
+			SQL:             sqlStr,
+			ActorKey:        rlKey,
+		}, timeout, hitl.DefaultMaxPendingGlobal, hitl.DefaultMaxPendingPerActor)
+		if qErr != nil {
+			dec.Rule = "hitl_quota_exceeded"
+			dec.Reason = qErr.Error()
+			s.emitAudit(prof, caller, sqlStr, dec, firewall.RLSResult{}, nil, "BLOCKED", qErr.Error(), 0, false, 0, nil, time.Since(t0), 0)
+			return fmt.Sprintf("BLOCKED by pgveil HITL quota: %v", qErr), true
+		}
+		if prof.Firewall.HITLMode == "reject" {
+			_, _ = s.hitlMgr.Resolve(req.ID, false, "policy:reject-mode", dec.Reason)
+			s.emitAudit(prof, caller, sqlStr, dec, firewall.RLSResult{}, nil, "HITL_DENIED", dec.Reason, 0, false, 0, nil, time.Since(t0), 0)
+			return fmt.Sprintf("APPROVAL REQUIRED [%s]: request %s rejected immediately by hitl_mode=reject", dec.Rule, req.ID), true
+		}
+		if s.chatOps != nil {
+			s.chatOps.NotifyHITLPending(*req)
+		}
+		st, note := s.hitlMgr.Wait(ctx, req)
+		switch st {
+		case hitl.StatusApproved:
+			hitlDecision = "HITL_APPROVED"
+		case hitl.StatusDenied:
+			s.emitAudit(prof, caller, sqlStr, dec, firewall.RLSResult{}, nil, "HITL_DENIED", note, 0, false, 0, nil, time.Since(t0), 0)
+			return fmt.Sprintf("DENIED by operator (request %s): %s", req.ID, note), true
+		default:
+			s.emitAudit(prof, caller, sqlStr, dec, firewall.RLSResult{}, nil, "HITL_EXPIRED", note, 0, false, 0, nil, time.Since(t0), 0)
+			return fmt.Sprintf("EXPIRED waiting for operator approval (request %s)", req.ID), true
+		}
+	}
+
+	// 4. Typed AST Virtual Row-Level Security (RLS) with fail-closed {{jwt.*}} claim binding
 	execSQL := sqlStr
 	var rlsRes firewall.RLSResult
 	if !prof.IsAuditOnly() && len(prof.Firewall.RowFilters) > 0 {
@@ -407,10 +559,15 @@ func (s *Server) toolQuery(ctx context.Context, prof *policy.RoleProfile, sqlStr
 		rlsRes, rlsErr = firewall.RewriteWithRLS(sqlStr, prof, firewall.SessionContext{
 			DBUser:          cfg.Server.UpstreamUser,
 			Database:        cfg.Server.UpstreamDatabase,
-			ApplicationName: "pgveil-mcp",
+			ApplicationName: caller.Source,
 			RoleProfile:     prof.Name,
+			Claims:          caller.Claims,
 		})
 		if rlsErr != nil {
+			dec.Rule = "virtual_rls_missing_claim"
+			dec.Reason = rlsErr.Error()
+			dec.RiskLevel = "HIGH"
+			s.emitAudit(prof, caller, sqlStr, dec, firewall.RLSResult{}, nil, "BLOCKED", rlsErr.Error(), 0, false, 0, nil, time.Since(t0), 0)
 			return fmt.Sprintf("BLOCKED by pgveil Virtual RLS: %v", rlsErr), true
 		}
 		if rlsRes.Rewritten {
@@ -418,16 +575,50 @@ func (s *Server) toolQuery(ctx context.Context, prof *policy.RoleProfile, sqlStr
 		}
 	}
 
-	conn, err := s.dialDB(ctx)
+	// 5. Sideband EXPLAIN (FORMAT JSON) Cost & Blast-Radius Guard
+	var planMetrics *firewall.PlanMetrics
+	if s.costRunner != nil && prof.Firewall.CostGuard.Enabled {
+		cv := s.costRunner.Check(ctx, execSQL, dec.Fingerprint, rlsRes.RulesApplied, prof)
+		planMetrics = cv.Metrics
+		if cv.Evaluated && s.metrics != nil && s.metrics.CostGuardEvaluations != nil {
+			outcome := "allow"
+			if cv.Fallback {
+				outcome = "fallback"
+			} else if cv.Blocked {
+				outcome = "block"
+			}
+			cacheLbl := "miss"
+			if cv.CacheHit {
+				cacheLbl = "hit"
+			}
+			s.metrics.CostGuardEvaluations.WithLabelValues(prof.Name, outcome, cacheLbl).Inc()
+		}
+		if cv.Blocked && !prof.IsAuditOnly() {
+			dec.Rule = cv.Rule
+			dec.Reason = cv.Reason
+			dec.RiskLevel = "HIGH"
+			s.emitAudit(prof, caller, sqlStr, dec, rlsRes, planMetrics, "BLOCKED", cv.Reason, 0, false, 0, nil, time.Since(t0), 0)
+			return fmt.Sprintf("BLOCKED by pgveil Cost Guard [%s]: %s", cv.Rule, cv.Reason), true
+		}
+	}
+
+	proxyOverhead := time.Since(t0)
+
+	// 6. Execute via pooled PostgreSQL connection with enforced max_query_duration
+	pool, err := s.getPool(ctx)
 	if err != nil {
 		return "database connection error: " + err.Error(), true
 	}
-	defer conn.Close(context.Background())
 
-	qCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	qTimeout := prof.Firewall.MaxQueryDurationParsed()
+	if qTimeout <= 0 {
+		qTimeout = 15 * time.Second
+	}
+	qCtx, cancel := context.WithTimeout(ctx, qTimeout)
 	defer cancel()
 
-	rows, err := conn.Query(qCtx, execSQL)
+	upStart := time.Now()
+	rows, err := pool.Query(qCtx, execSQL)
 	if err != nil {
 		return "PostgreSQL error: " + err.Error(), true
 	}
@@ -470,6 +661,7 @@ func (s *Server) toolQuery(ctx context.Context, prof *policy.RoleProfile, sqlStr
 	result := make([]map[string]any, 0, 32)
 	truncated := false
 	maskedCells := 0
+	entityCounts := make(map[string]int)
 
 	for rows.Next() {
 		if maxRows > 0 && len(result) >= maxRows {
@@ -489,11 +681,17 @@ func (s *Server) toolQuery(ctx context.Context, prof *policy.RoleProfile, sqlStr
 				if setNull {
 					rec[col] = nil
 					maskedCells++
+					for k, v := range found {
+						entityCounts[k] += v
+					}
 					continue
 				}
 				if len(found) > 0 && mv != val {
 					val = mv
 					maskedCells++
+					for k, v := range found {
+						entityCounts[k] += v
+					}
 				}
 			}
 			rec[col] = val
@@ -503,6 +701,17 @@ func (s *Server) toolQuery(ctx context.Context, prof *policy.RoleProfile, sqlStr
 	if err := rows.Err(); err != nil {
 		return "PostgreSQL error: " + err.Error(), true
 	}
+	upDur := time.Since(upStart)
+
+	finalDecision := "ALLOW"
+	if hitlDecision != "" {
+		finalDecision = hitlDecision
+	} else if truncated {
+		finalDecision = "TRUNCATED"
+	} else if maskedCells > 0 {
+		finalDecision = "MASKED"
+	}
+	s.emitAudit(prof, caller, sqlStr, dec, rlsRes, planMetrics, finalDecision, dec.Reason, len(result), truncated, maskedCells, entityCounts, proxyOverhead, upDur)
 
 	outMap := map[string]any{
 		"profile":          prof.Name,
@@ -515,27 +724,115 @@ func (s *Server) toolQuery(ctx context.Context, prof *policy.RoleProfile, sqlStr
 		outMap["rls_rewritten"] = true
 		outMap["rls_rules_applied"] = rlsRes.RulesApplied
 	}
+	if planMetrics != nil {
+		outMap["estimated_cost"] = planMetrics.TotalCost
+		outMap["estimated_rows"] = planMetrics.PlanRows
+	}
 	payload, _ := json.MarshalIndent(outMap, "", "  ")
 	return string(payload), false
 }
 
-func (s *Server) dialDB(ctx context.Context) (*pgx.Conn, error) {
-	dsn := s.dsn
-	if dsn == "" {
-		cfg := s.policyMgr.Config()
-		dsn = policy.BuildDSN(
-			cfg.Server.UpstreamAddr,
-			cfg.Server.UpstreamUser,
-			cfg.Server.UpstreamPassword,
-			cfg.Server.UpstreamDatabase,
-			"pgveil-mcp",
-			cfg.Server.UpstreamTLS.Enabled,
-		)
+func (s *Server) emitAudit(
+	prof *policy.RoleProfile,
+	caller CallerIdentity,
+	sqlStr string,
+	dec firewall.Decision,
+	rlsRes firewall.RLSResult,
+	pm *firewall.PlanMetrics,
+	decision string,
+	reason string,
+	rowsReturned int,
+	truncated bool,
+	maskedCells int,
+	entities map[string]int,
+	overhead time.Duration,
+	upDur time.Duration,
+) {
+	if s.eventBus == nil {
+		return
 	}
-	connCfg, err := pgx.ParseConfig(dsn)
+	cfg := s.policyMgr.Config()
+	rewrittenPreview := ""
+	if rlsRes.Rewritten {
+		rewrittenPreview = rlsRes.SQL
+	}
+	ev := events.AuditEvent{
+		ClientAddr:          caller.ClientAddr,
+		Source:              caller.Source,
+		AuthSubject:         caller.Subject,
+		DBUser:              cfg.Server.UpstreamUser,
+		DatabaseName:        cfg.Server.UpstreamDatabase,
+		ApplicationName:     caller.Source,
+		RoleProfile:         prof.Name,
+		StatementType:       dec.StatementType,
+		SQLFingerprint:      dec.Fingerprint,
+		RawSQLPreview:       strings.TrimSpace(sqlStr),
+		RLSRewritten:        rlsRes.Rewritten,
+		RLSRulesApplied:     rlsRes.RulesApplied,
+		RewrittenSQLPreview: rewrittenPreview,
+		Decision:            decision,
+		RiskLevel:           dec.RiskLevel,
+		PolicyRule:          dec.Rule,
+		PolicyReason:        reason,
+		TablesAccessed:      dec.Tables,
+		RowsReturned:        rowsReturned,
+		RowsTruncated:       truncated,
+		PIIFieldsMasked:     maskedCells,
+		PIIEntities:         entities,
+		ProxyOverheadUs:     overhead.Microseconds(),
+		UpstreamDurationUs:  upDur.Microseconds(),
+	}
+	if pm != nil {
+		ev.EstimatedCost = pm.TotalCost
+		ev.EstimatedRows = pm.PlanRows
+		ev.SeqScanTables = pm.SeqScanTables
+	}
+	s.eventBus.Publish(ev)
+}
+
+func (s *Server) resolveDSN() string {
+	if s.dsn != "" {
+		return s.dsn
+	}
+	cfg := s.policyMgr.Config()
+	return policy.BuildDSN(
+		cfg.Server.UpstreamAddr,
+		cfg.Server.UpstreamUser,
+		cfg.Server.UpstreamPassword,
+		cfg.Server.UpstreamDatabase,
+		"pgveil-mcp",
+		cfg.Server.UpstreamTLS.Enabled,
+	)
+}
+
+func (s *Server) getPool(ctx context.Context) (*pgxpool.Pool, error) {
+	dsn := s.resolveDSN()
+	s.poolMu.Lock()
+	defer s.poolMu.Unlock()
+
+	if s.pool != nil && s.poolDSN == dsn {
+		return s.pool, nil
+	}
+	if s.pool != nil {
+		s.pool.Close()
+		s.pool = nil
+	}
+
+	pcfg, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
 		return nil, err
 	}
-	connCfg.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
-	return pgx.ConnectConfig(ctx, connCfg)
+	pcfg.MaxConns = 10
+	pcfg.MinConns = 0
+	pcfg.MaxConnIdleTime = 2 * time.Minute
+	pcfg.ConnConfig.ConnectTimeout = 3 * time.Second
+	pcfg.ConnConfig.DefaultQueryExecMode = pgx.QueryExecModeSimpleProtocol
+
+	pool, err := pgxpool.NewWithConfig(ctx, pcfg)
+	if err != nil {
+		return nil, err
+	}
+	s.pool = pool
+	s.poolDSN = dsn
+	return pool, nil
 }

@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/duhanguler/pgveil/internal/chatops"
 	"github.com/duhanguler/pgveil/internal/events"
 	"github.com/duhanguler/pgveil/internal/firewall"
 	"github.com/duhanguler/pgveil/internal/hitl"
@@ -31,13 +32,15 @@ import (
 
 // Server is the Zero-Trust PostgreSQL Wire Protocol v3 proxy server.
 type Server struct {
-	policyMgr *policy.Manager
-	hitlMgr   *hitl.Manager
-	eventBus  *events.Bus
-	metrics   *telemetry.Metrics
-	tracer    trace.Tracer
-	limiter   *ratelimit.Limiter
-	tlsConfig *tls.Config
+	policyMgr  *policy.Manager
+	hitlMgr    *hitl.Manager
+	eventBus   *events.Bus
+	metrics    *telemetry.Metrics
+	tracer     trace.Tracer
+	limiter    *ratelimit.Limiter
+	costRunner *firewall.CostRunner
+	chatOps    *chatops.Notifier
+	tlsConfig  *tls.Config
 
 	mu       sync.Mutex
 	listener net.Listener
@@ -53,12 +56,14 @@ func NewServer(
 	tracer trace.Tracer,
 ) (*Server, error) {
 	s := &Server{
-		policyMgr: policyMgr,
-		hitlMgr:   hitlMgr,
-		eventBus:  eventBus,
-		metrics:   metrics,
-		tracer:    tracer,
-		limiter:   ratelimit.NewLimiter(),
+		policyMgr:  policyMgr,
+		hitlMgr:    hitlMgr,
+		eventBus:   eventBus,
+		metrics:    metrics,
+		tracer:     tracer,
+		limiter:    ratelimit.NewLimiter(),
+		costRunner: firewall.NewCostRunner(policyMgr, ""),
+		chatOps:    chatops.NewNotifier(policyMgr, metrics),
 	}
 	cfg := policyMgr.Config()
 	if cfg.Server.TLS.Enabled && cfg.Server.TLS.CertFile != "" && cfg.Server.TLS.KeyFile != "" {
@@ -113,7 +118,18 @@ func (s *Server) Start(ctx context.Context) error {
 	}
 
 	s.wg.Wait()
+	s.costRunner.Close()
 	return nil
+}
+
+// CostRunner returns the shared sideband EXPLAIN cost evaluator so MCP and Playground reuse the plan cache.
+func (s *Server) CostRunner() *firewall.CostRunner {
+	return s.costRunner
+}
+
+// ChatOps returns the interactive ChatOps HITL notifier.
+func (s *Server) ChatOps() *chatops.Notifier {
+	return s.chatOps
 }
 
 // Addr returns the bound listener address (useful in tests with :0 ephemeral ports).
@@ -218,12 +234,20 @@ func (s *Server) handleConnection(ctx context.Context, clientConn net.Conn) {
 		return
 	}
 
+	initProfile := s.policyMgr.MatchProfile(meta.dbUser, meta.appName)
+	if mqd := initProfile.Firewall.MaxQueryDurationParsed(); mqd > 0 {
+		if err := s.injectSessionTimeout(upstreamReader, upstreamConn, meta, mqd); err != nil {
+			slog.Debug("failed to inject startup statement_timeout", "user", meta.dbUser, "err", err)
+			return
+		}
+	}
+
 	slog.Debug("session authenticated",
 		"client", meta.clientAddr,
 		"user", meta.dbUser,
 		"db", meta.database,
 		"app", meta.appName,
-		"profile", s.policyMgr.MatchProfile(meta.dbUser, meta.appName).Name,
+		"profile", initProfile.Name,
 	)
 
 	// 3. Main PostgreSQL wire command loop (Simple & Extended Query Protocol)
@@ -436,12 +460,34 @@ func (s *Server) handleSimpleQuery(
 		}
 	}
 
+	// Sideband Read-Only EXPLAIN (FORMAT JSON) Cost & Blast-Radius Guard (runs AFTER Virtual RLS rewrite)
+	effectiveSQL := sql
+	if rlsRes.Rewritten {
+		effectiveSQL = rlsRes.SQL
+	}
+	costStart := time.Now()
+	costVerdict := s.evaluateCostGuard(spanCtx, profile, effectiveSQL, dec.Fingerprint, rlsRes.RulesApplied)
+	if costVerdict.Evaluated {
+		proxyOverhead += time.Since(costStart)
+	}
+	if costVerdict.Blocked {
+		dec.Rule = costVerdict.Rule
+		dec.Reason = costVerdict.Reason
+		dec.RiskLevel = "HIGH"
+		if profile.IsAuditOnly() {
+			hitlOutcome = "WOULD_BLOCK"
+		} else {
+			s.recordAndEmitBlockedWithCost(span, meta, profile, sql, dec, costVerdict.Metrics, "BLOCKED", proxyOverhead)
+			return s.sendBlockedErrorCode(clientW, meta.txStatus, "54000", costVerdict.Reason, fmt.Sprintf("rule=%s profile=%s", costVerdict.Rule, profile.Name), "Add selective WHERE filters, indexes, or smaller LIMIT")
+		}
+	}
+
 	// Forward approved (and optionally RLS-rewritten) SQL to upstream PostgreSQL
 	upstreamStart := time.Now()
 	if err := pgwire.WriteMessage(upstreamW, pgwire.MsgQuery, rawPayload); err != nil {
 		return err
 	}
-	return s.relayResponseCycle(span, clientW, upstreamR, meta, profile, sql, "", dec, rlsRes, hitlOutcome, proxyOverhead, upstreamStart)
+	return s.relayResponseCycle(span, clientW, upstreamR, meta, profile, sql, "", dec, rlsRes, costVerdict.Metrics, hitlOutcome, proxyOverhead, upstreamStart)
 }
 
 func (s *Server) handleExtendedBatch(
@@ -633,6 +679,31 @@ func (s *Server) handleExtendedBatch(
 		}
 	}
 
+	var batchPlanMetrics *firewall.PlanMetrics
+	if hasQuery {
+		effectiveSQL := primarySQL
+		if batchRLS.Rewritten {
+			effectiveSQL = batchRLS.SQL
+		}
+		costStart := time.Now()
+		costVerdict := s.evaluateCostGuard(spanCtx, profile, effectiveSQL, primaryDec.Fingerprint, batchRLS.RulesApplied)
+		if costVerdict.Evaluated {
+			proxyOverhead += time.Since(costStart)
+		}
+		batchPlanMetrics = costVerdict.Metrics
+		if costVerdict.Blocked {
+			primaryDec.Rule = costVerdict.Rule
+			primaryDec.Reason = costVerdict.Reason
+			primaryDec.RiskLevel = "HIGH"
+			if profile.IsAuditOnly() {
+				hitlOutcome = "WOULD_BLOCK"
+			} else {
+				s.recordAndEmitBlockedWithCost(span, meta, profile, primarySQL, primaryDec, costVerdict.Metrics, "BLOCKED", proxyOverhead)
+				return s.sendBlockedErrorCode(clientW, meta.txStatus, "54000", costVerdict.Reason, fmt.Sprintf("rule=%s profile=%s", costVerdict.Rule, profile.Name), "Add selective WHERE filters, indexes, or smaller LIMIT")
+			}
+		}
+	}
+
 	upstreamStart := time.Now()
 	for _, m := range batch {
 		if err := pgwire.WriteMessage(upstreamW, m.msgType, m.payload); err != nil {
@@ -646,7 +717,7 @@ func (s *Server) handleExtendedBatch(
 	if !hasQuery {
 		primaryDec = firewall.Decision{Action: firewall.ActionAllow, StatementType: "EXTENDED", RiskLevel: "LOW", Rule: "policy_allow"}
 	}
-	return s.relayResponseCycle(span, clientW, upstreamR, meta, profile, primarySQL, activeStmtName, primaryDec, batchRLS, hitlOutcome, proxyOverhead, upstreamStart)
+	return s.relayResponseCycle(span, clientW, upstreamR, meta, profile, primarySQL, activeStmtName, primaryDec, batchRLS, batchPlanMetrics, hitlOutcome, proxyOverhead, upstreamStart)
 }
 
 func (s *Server) relayUntilFlush(clientW io.Writer, upstreamR io.Reader, meta *sessionMeta, stmtName string, batch []wireMsg) error {
@@ -715,6 +786,7 @@ func (s *Server) relayResponseCycle(
 	stmtName string,
 	dec firewall.Decision,
 	rlsRes firewall.RLSResult,
+	planMetrics *firewall.PlanMetrics,
 	hitlOutcome string,
 	proxyOverhead time.Duration,
 	upstreamStart time.Time,
@@ -907,7 +979,7 @@ func (s *Server) relayResponseCycle(
 				finalDecision = "MASKED"
 			}
 
-			s.emitTelemetryAndAudit(span, meta, profile, sql, dec, rlsRes, finalDecision, policyReason,
+			s.emitTelemetryAndAudit(span, meta, profile, sql, dec, rlsRes, planMetrics, finalDecision, policyReason,
 				rowsReturned, rowsDropped, rowsTruncated, piiFieldsMasked, piiEntityCounts,
 				proxyOverhead, upstreamDur)
 
@@ -926,6 +998,50 @@ func (s *Server) relayResponseCycle(
 	}
 }
 
+func (s *Server) injectSessionTimeout(upstreamR io.Reader, upstreamW io.Writer, meta *sessionMeta, dur time.Duration) error {
+	ms := dur.Milliseconds()
+	if ms <= 0 {
+		ms = 1
+	}
+	setSQL := fmt.Sprintf("SET statement_timeout = '%dms'", ms)
+	if err := pgwire.WriteMessage(upstreamW, pgwire.MsgQuery, pgwire.BuildSimpleQuery(setSQL)); err != nil {
+		return err
+	}
+	for {
+		mType, payload, err := pgwire.ReadMessage(upstreamR)
+		if err != nil {
+			return err
+		}
+		if mType == pgwire.MsgReadyForQuery {
+			if len(payload) > 0 {
+				meta.txStatus = payload[0]
+			}
+			return nil
+		}
+	}
+}
+
+func (s *Server) evaluateCostGuard(ctx context.Context, profile *policy.RoleProfile, sql string, fp string, rlsRules []string) firewall.CostVerdict {
+	if s.costRunner == nil || profile == nil || !profile.Firewall.CostGuard.Enabled {
+		return firewall.CostVerdict{}
+	}
+	cv := s.costRunner.Check(ctx, sql, fp, rlsRules, profile)
+	if cv.Evaluated && s.metrics != nil && s.metrics.CostGuardEvaluations != nil {
+		outcome := "allow"
+		if cv.Fallback {
+			outcome = "fallback"
+		} else if cv.Blocked {
+			outcome = "block"
+		}
+		cacheLabel := "miss"
+		if cv.CacheHit {
+			cacheLabel = "hit"
+		}
+		s.metrics.CostGuardEvaluations.WithLabelValues(profile.Name, outcome, cacheLabel).Inc()
+	}
+	return cv
+}
+
 func (s *Server) handleHITL(
 	ctx context.Context,
 	meta *sessionMeta,
@@ -934,7 +1050,13 @@ func (s *Server) handleHITL(
 	dec firewall.Decision,
 ) (approved bool, outcome string, detail string) {
 	timeout := profile.HITLTimeoutDuration(60 * time.Second)
-	req := s.hitlMgr.Create(hitl.ApprovalRequest{
+	host, _, err := net.SplitHostPort(meta.clientAddr)
+	if err != nil {
+		host = meta.clientAddr
+	}
+	actorKey := profile.Name + ":" + host
+
+	req, qErr := s.hitlMgr.CreateWithQuota(hitl.ApprovalRequest{
 		ClientAddr:      meta.clientAddr,
 		DBUser:          meta.dbUser,
 		Database:        meta.database,
@@ -946,7 +1068,11 @@ func (s *Server) handleHITL(
 		Reason:          dec.Reason,
 		Tables:          dec.Tables,
 		SQL:             sql,
-	}, timeout)
+		ActorKey:        actorKey,
+	}, timeout, hitl.DefaultMaxPendingGlobal, hitl.DefaultMaxPendingPerActor)
+	if qErr != nil {
+		return false, "BLOCKED", qErr.Error()
+	}
 
 	if profile.Firewall.HITLMode == "reject" {
 		_, _ = s.hitlMgr.Resolve(req.ID, false, "policy:reject-mode", dec.Reason)
@@ -962,7 +1088,9 @@ func (s *Server) handleHITL(
 		"statement", dec.StatementType,
 		"timeout", timeout.String(),
 	)
-	s.fireWebhookAsync(fmt.Sprintf("[pgveil HITL PENDING %s] Profile=%q Statement=%s SQL=%q — Approve in Web Console", req.ID, profile.Name, dec.StatementType, sql))
+	if s.chatOps != nil {
+		s.chatOps.NotifyHITLPending(*req)
+	}
 
 	status, note := s.hitlMgr.Wait(ctx, req)
 	if s.metrics != nil {
@@ -1077,6 +1205,19 @@ func (s *Server) recordAndEmitBlocked(
 	decisionLabel string,
 	proxyOverhead time.Duration,
 ) {
+	s.recordAndEmitBlockedWithCost(span, meta, profile, sql, dec, nil, decisionLabel, proxyOverhead)
+}
+
+func (s *Server) recordAndEmitBlockedWithCost(
+	span trace.Span,
+	meta *sessionMeta,
+	profile *policy.RoleProfile,
+	sql string,
+	dec firewall.Decision,
+	planMetrics *firewall.PlanMetrics,
+	decisionLabel string,
+	proxyOverhead time.Duration,
+) {
 	if s.metrics != nil {
 		s.metrics.QueriesTotal.WithLabelValues(profile.Name, dec.StatementType, decisionLabel).Inc()
 		s.metrics.BlockedTotal.WithLabelValues(profile.Name, dec.Rule, dec.RiskLevel).Inc()
@@ -1091,9 +1232,10 @@ func (s *Server) recordAndEmitBlocked(
 		)
 	}
 	if s.eventBus != nil {
-		s.eventBus.Publish(events.AuditEvent{
+		ev := events.AuditEvent{
 			TraceID:         traceID,
 			ClientAddr:      meta.clientAddr,
+			Source:          "wire",
 			DBUser:          meta.dbUser,
 			DatabaseName:    meta.database,
 			ApplicationName: meta.appName,
@@ -1107,7 +1249,13 @@ func (s *Server) recordAndEmitBlocked(
 			PolicyReason:    dec.Reason,
 			TablesAccessed:  dec.Tables,
 			ProxyOverheadUs: proxyOverhead.Microseconds(),
-		})
+		}
+		if planMetrics != nil {
+			ev.EstimatedCost = planMetrics.TotalCost
+			ev.EstimatedRows = planMetrics.PlanRows
+			ev.SeqScanTables = planMetrics.SeqScanTables
+		}
+		s.eventBus.Publish(ev)
 	}
 	if dec.RiskLevel == "CRITICAL" && decisionLabel == "BLOCKED" {
 		s.fireWebhookAsync(fmt.Sprintf("[pgveil CRITICAL BLOCK] Profile=%q Rule=%s Reason=%q SQL=%q", profile.Name, dec.Rule, dec.Reason, strings.TrimSpace(sql)))
@@ -1121,6 +1269,7 @@ func (s *Server) emitTelemetryAndAudit(
 	sql string,
 	dec firewall.Decision,
 	rlsRes firewall.RLSResult,
+	planMetrics *firewall.PlanMetrics,
 	finalDecision string,
 	policyReason string,
 	rowsReturned int,
@@ -1166,9 +1315,10 @@ func (s *Server) emitTelemetryAndAudit(
 		if rlsRes.Rewritten {
 			rewrittenPreview = strings.TrimSpace(rlsRes.SQL)
 		}
-		s.eventBus.Publish(events.AuditEvent{
+		ev := events.AuditEvent{
 			TraceID:             traceID,
 			ClientAddr:          meta.clientAddr,
+			Source:              "wire",
 			DBUser:              meta.dbUser,
 			DatabaseName:        meta.database,
 			ApplicationName:     meta.appName,
@@ -1190,7 +1340,13 @@ func (s *Server) emitTelemetryAndAudit(
 			PIIEntities:         piiEntities,
 			ProxyOverheadUs:     proxyOverhead.Microseconds(),
 			UpstreamDurationUs:  upstreamDur.Microseconds(),
-		})
+		}
+		if planMetrics != nil {
+			ev.EstimatedCost = planMetrics.TotalCost
+			ev.EstimatedRows = planMetrics.PlanRows
+			ev.SeqScanTables = planMetrics.SeqScanTables
+		}
+		s.eventBus.Publish(ev)
 	}
 }
 

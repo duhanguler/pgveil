@@ -25,8 +25,11 @@ type Metrics struct {
 	HITLDecisions      *prometheus.CounterVec
 	ActiveConnections  prometheus.Gauge
 	ProxyOverheadUs    *prometheus.HistogramVec
-	UpstreamDurationUs *prometheus.HistogramVec
-	KafkaPublished     *prometheus.CounterVec
+	UpstreamDurationUs   *prometheus.HistogramVec
+	KafkaPublished       *prometheus.CounterVec
+	CostGuardEvaluations *prometheus.CounterVec
+	MCPHTTPRequests      *prometheus.CounterVec
+	HITLChatOps          *prometheus.CounterVec
 }
 
 // NewMetrics registers pgveil Prometheus metrics on the provided registerer.
@@ -78,6 +81,18 @@ func NewMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "pgveil_kafka_events_total",
 			Help: "Total audit and security alert events published to Kafka.",
 		}, []string{"topic", "status"}),
+		CostGuardEvaluations: f.NewCounterVec(prometheus.CounterOpts{
+			Name: "pgveil_cost_guard_evaluations_total",
+			Help: "Total EXPLAIN cost guard evaluations by profile, outcome, and plan cache state.",
+		}, []string{"role", "outcome", "cache"}),
+		MCPHTTPRequests: f.NewCounterVec(prometheus.CounterOpts{
+			Name: "pgveil_mcp_http_requests_total",
+			Help: "Total Streamable HTTP MCP requests by JSON-RPC method, profile, and HTTP status.",
+		}, []string{"method", "role", "status"}),
+		HITLChatOps: f.NewCounterVec(prometheus.CounterOpts{
+			Name: "pgveil_hitl_chatops_total",
+			Help: "Total interactive ChatOps HITL dispatches and callback verifications.",
+		}, []string{"channel", "event"}),
 	}
 }
 

@@ -22,6 +22,21 @@ server:
 notifications:
   webhook_url: ""
 
+mcp:
+  http_enabled: true
+  auth:
+    enabled: true
+    jwt_secret: "pgveil-demo-jwt-hs256-secret"
+    role_claim: "role"
+    allowed_profiles: ["ai_agent", "tenant_tr", "tenant_jwt", "analyst"]
+    api_keys:
+      - name: "demo-istanbul-tenant"
+        token: "pgv_demo_istanbul_tenant"
+        profile: "tenant_jwt"
+        claims:
+          city: "Istanbul"
+          tenant_id: "tr-ist-01"
+
 security:
   masking_secret: "pgveil-demo-ephemeral-hmac-secret"
   hitl_default_timeout: "60s"
@@ -64,6 +79,11 @@ profiles:
       denied_tables: ["api_secrets", "pg_shadow", "pg_authid", "pg_roles"]
       max_rows: 25
       max_rows_action: "truncate"
+      max_query_duration: "5s"
+      cost_guard:
+        enabled: true
+        max_total_cost: 50000
+        max_estimated_rows: 100000
     masking:
       enabled: true
       auto_detect_pii: true
@@ -198,6 +218,55 @@ profiles:
       auto_detect_pii: true
       compliance_packs: ["pci-dss", "kvkk", "secrets"]
       column_rules:
+        - column: "tckn"
+          strategy: "partial"
+        - column: "iban"
+          strategy: "partial"
+        - column: "card_number"
+          strategy: "last4"
+        - column: "secret_value"
+          strategy: "redact"
+
+  - name: "tenant_jwt"
+    description: "Zero-trust Remote MCP + JWT claim-bound Virtual RLS profile: injects city = {{jwt.city}} with fail-closed missing-claim guard."
+    mode: "enforce"
+    match:
+      application_names: ["tenant_jwt*"]
+      users: ["tenant_jwt"]
+    firewall:
+      allow_statements: ["SELECT", "EXPLAIN", "SHOW"]
+      block_ddl: true
+      block_multi_statement: true
+      block_write_without_where: true
+      block_dangerous_functions: true
+      block_system_catalogs: true
+      block_pii_inference: true
+      protected_columns: ["tckn", "national_id", "ssn", "iban", "card_number", "credit_card", "secret_value"]
+      require_hitl_statements: ["UPDATE", "DELETE"]
+      hitl_mode: "hold"
+      hitl_timeout: "60s"
+      denied_tables: ["api_secrets", "pg_shadow", "pg_authid", "pg_roles"]
+      row_filters:
+        - table: "customers"
+          predicate: "city = {{jwt.city}}"
+      max_rows: 100
+      max_rows_action: "truncate"
+      max_query_duration: "5s"
+      cost_guard:
+        enabled: true
+        max_total_cost: 50000
+        max_estimated_rows: 100000
+    masking:
+      enabled: true
+      auto_detect_pii: true
+      compliance_packs: ["gdpr", "kvkk", "pci-dss", "hipaa", "secrets"]
+      column_rules:
+        - column: "email"
+          strategy: "partial"
+        - column: "full_name"
+          strategy: "hash"
+        - column: "phone"
+          strategy: "partial"
         - column: "tckn"
           strategy: "partial"
         - column: "iban"

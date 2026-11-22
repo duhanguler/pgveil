@@ -75,4 +75,38 @@ func TestManagerLifecycleAndSubscribers(t *testing.T) {
 	if len(expired) == 0 {
 		t.Fatal("expected expired items in filtered list")
 	}
+
+	// 5. Get, AlreadyResolvedError, and CreateWithQuota per-actor & global limits
+	if _, ok := mgr.Get("does_not_exist"); ok {
+		t.Fatal("expected missing Get to return false")
+	}
+	var nilARE *AlreadyResolvedError
+	if nilARE.Error() == "" {
+		t.Fatal("expected safe Error() on nil AlreadyResolvedError")
+	}
+	q1, err := mgr.CreateWithQuota(ApprovalRequest{RoleProfile: "ai", ActorKey: "ai:sub1", SQL: "DELETE 1"}, time.Minute, 10, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q2, err := mgr.CreateWithQuota(ApprovalRequest{RoleProfile: "ai", ActorKey: "ai:sub1", SQL: "DELETE 2"}, time.Minute, 10, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 3rd concurrent pending hold for same actor -> ErrHITLQuotaExceeded!
+	if _, err := mgr.CreateWithQuota(ApprovalRequest{RoleProfile: "ai", ActorKey: "ai:sub1", SQL: "DELETE 3"}, time.Minute, 10, 2); err == nil {
+		t.Fatal("expected per-actor quota exceeded")
+	}
+	// Global limit = 2 -> another actor also blocked!
+	if _, err := mgr.CreateWithQuota(ApprovalRequest{RoleProfile: "ai", ActorKey: "ai:sub2", SQL: "DELETE 4"}, time.Minute, 2, 5); err == nil {
+		t.Fatal("expected global quota exceeded")
+	}
+	if got, ok := mgr.Get(q1.ID); !ok || got.Status != StatusPending {
+		t.Fatalf("unexpected Get: %+v", got)
+	}
+	_, _ = mgr.Resolve(q1.ID, true, "op1", "ok")
+	_, dupErr := mgr.Resolve(q1.ID, false, "op2", "too late")
+	if dupErr == nil || dupErr.Error() == "" {
+		t.Fatal("expected AlreadyResolvedError on duplicate Resolve")
+	}
+	_, _ = mgr.Resolve(q2.ID, false, "op1", "no")
 }

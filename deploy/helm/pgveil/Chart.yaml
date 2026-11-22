@@ -2,8 +2,8 @@ apiVersion: v2
 name: pgveil
 description: Zero-Trust PostgreSQL Wire-Protocol Dynamic PII Masking & AI-Agent SQL Firewall Proxy
 type: application
-version: 0.4.0
-appVersion: "0.4.0"
+version: 0.5.0
+appVersion: "0.5.0"
 keywords:
   - postgresql
   - security

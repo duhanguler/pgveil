@@ -10,16 +10,20 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/duhanguler/pgveil/internal/chatops"
 	"github.com/duhanguler/pgveil/internal/discover"
 	"github.com/duhanguler/pgveil/internal/events"
 	"github.com/duhanguler/pgveil/internal/firewall"
 	"github.com/duhanguler/pgveil/internal/hitl"
+	"github.com/duhanguler/pgveil/internal/mcpserver"
 	"github.com/duhanguler/pgveil/internal/pii"
 	"github.com/duhanguler/pgveil/internal/policy"
+	"github.com/duhanguler/pgveil/internal/telemetry"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/prometheus/client_golang/prometheus"
@@ -29,13 +33,17 @@ import (
 // Server serves the Control Plane REST API, real-time SSE stream, Prometheus /metrics,
 // live SQL Playground (wired through pgveil's real wire proxy!), and embedded Web Console.
 type Server struct {
-	policyMgr *policy.Manager
-	hitlMgr   *hitl.Manager
-	eventBus  *events.Bus
-	proxyAddr func() string
-	promReg   prometheus.Gatherer
-	webFS     fs.FS
-	version   string
+	policyMgr  *policy.Manager
+	hitlMgr    *hitl.Manager
+	eventBus   *events.Bus
+	costRunner *firewall.CostRunner
+	chatOps    *chatops.Notifier
+	mcpSrv     *mcpserver.Server
+	metrics    *telemetry.Metrics
+	proxyAddr  func() string
+	promReg    prometheus.Gatherer
+	webFS      fs.FS
+	version    string
 }
 
 func NewServer(
@@ -50,14 +58,44 @@ func NewServer(
 	if promReg == nil {
 		promReg = prometheus.DefaultGatherer
 	}
+	cr := firewall.NewCostRunner(policyMgr, "")
+	co := chatops.NewNotifier(policyMgr, nil)
+	ms := mcpserver.NewServer(policyMgr, "ai_agent", "", version).AttachControlPlane(hitlMgr, eventBus, cr, co, nil)
 	return &Server{
-		policyMgr: policyMgr,
-		hitlMgr:   hitlMgr,
-		eventBus:  eventBus,
-		proxyAddr: proxyAddr,
-		promReg:   promReg,
-		webFS:     webFS,
-		version:   version,
+		policyMgr:  policyMgr,
+		hitlMgr:    hitlMgr,
+		eventBus:   eventBus,
+		costRunner: cr,
+		chatOps:    co,
+		mcpSrv:     ms,
+		proxyAddr:  proxyAddr,
+		promReg:    promReg,
+		webFS:      webFS,
+		version:    version,
+	}
+}
+
+// AttachRuntime wires shared CostRunner, ChatOps Notifier, and Prometheus Metrics from the wire proxy
+// so both Wire Proxy and Streamable HTTP /mcp share a single PlanCache, HITL dispatcher, and metric registry.
+func (s *Server) AttachRuntime(costRunner *firewall.CostRunner, chatOps *chatops.Notifier, metrics *telemetry.Metrics) *Server {
+	if costRunner != nil {
+		if s.costRunner != nil && s.costRunner != costRunner {
+			s.costRunner.Close()
+		}
+		s.costRunner = costRunner
+	}
+	if chatOps != nil {
+		s.chatOps = chatOps
+	}
+	s.metrics = metrics
+	s.mcpSrv.AttachControlPlane(s.hitlMgr, s.eventBus, s.costRunner, s.chatOps, metrics)
+	return s
+}
+
+// Close releases pooled MCP and sideband CostRunner resources owned by the API server.
+func (s *Server) Close() {
+	if s.mcpSrv != nil {
+		s.mcpSrv.Close()
 	}
 }
 
@@ -83,6 +121,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/v1/approvals", s.handleListApprovals)
 	mux.HandleFunc("POST /api/v1/approvals/{id}/approve", s.handleResolveApproval(true))
 	mux.HandleFunc("POST /api/v1/approvals/{id}/deny", s.handleResolveApproval(false))
+	mux.HandleFunc("POST /api/v1/chatops/test", s.handleChatOpsTest)
+
+	// Cryptographically Verified ChatOps Webhooks (outside /api/v1/ admin_token; verified by HMAC-SHA256)
+	mux.HandleFunc("POST /webhooks/slack/interactions", s.handleSlackInteraction)
+	mux.HandleFunc("GET /webhooks/hitl/callback", s.handleHITLCallbackPreview)
+	mux.HandleFunc("POST /webhooks/hitl/callback", s.handleHITLCallbackAction)
+
+	// Streamable HTTP Model Context Protocol (2025-03-26) endpoint
+	mux.HandleFunc("/mcp", s.handleMCPHTTP)
 
 	// Embedded React Web Console
 	if s.webFS != nil {
@@ -120,13 +167,16 @@ func (s *Server) withOptionalAuth(next http.Handler) http.Handler {
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	cfg := s.policyMgr.Config()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"status":         "ok",
-		"version":        s.version,
-		"proxy_addr":     s.resolveProxyAddr(),
-		"upstream_addr":  cfg.Server.UpstreamAddr,
-		"kafka_enabled":  cfg.Kafka.Enabled,
-		"profiles_count": len(cfg.Profiles),
-		"pending_hitl":   s.hitlMgr.PendingCount(),
+		"status":             "ok",
+		"version":            s.version,
+		"proxy_addr":         s.resolveProxyAddr(),
+		"upstream_addr":      cfg.Server.UpstreamAddr,
+		"kafka_enabled":      cfg.Kafka.Enabled,
+		"mcp_http_enabled":   cfg.MCP.HTTPEnabled,
+		"mcp_auth_enabled":   cfg.MCP.Auth.Enabled,
+		"chatops_configured": s.chatOps.IsConfigured(),
+		"profiles_count":     len(cfg.Profiles),
+		"pending_hitl":       s.hitlMgr.PendingCount(),
 	})
 }
 
@@ -248,9 +298,10 @@ func (s *Server) handleReloadPolicies(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleInspect(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		SQL     string `json:"sql"`
-		Profile string `json:"profile"`
-		Sample  string `json:"sample_text"`
+		SQL       string            `json:"sql"`
+		Profile   string            `json:"profile"`
+		Sample    string            `json:"sample_text"`
+		JWTClaims map[string]string `json:"jwt_claims"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -264,15 +315,49 @@ func (s *Server) handleInspect(w http.ResponseWriter, r *http.Request) {
 	cfg := s.policyMgr.Config()
 	var rlsRes firewall.RLSResult
 	if dec.Action != firewall.ActionBlock && len(prof.Firewall.RowFilters) > 0 {
-		if res, rerr := firewall.RewriteWithRLS(req.SQL, prof, firewall.SessionContext{
+		res, rerr := firewall.RewriteWithRLS(req.SQL, prof, firewall.SessionContext{
 			DBUser:          cfg.Server.UpstreamUser,
 			Database:        cfg.Server.UpstreamDatabase,
 			ApplicationName: prof.Name,
 			RoleProfile:     prof.Name,
-		}); rerr == nil {
+			Claims:          req.JWTClaims,
+		})
+		if rerr != nil {
+			dec.Action = firewall.ActionBlock
+			dec.Rule = "virtual_rls_missing_claim"
+			dec.Reason = rerr.Error()
+			dec.RiskLevel = "HIGH"
+		} else {
 			rlsRes = res
 		}
 	}
+
+	var costInfo map[string]any
+	if dec.Action != firewall.ActionBlock && s.costRunner != nil && prof.Firewall.CostGuard.Enabled {
+		evalSQL := req.SQL
+		if rlsRes.Rewritten {
+			evalSQL = rlsRes.SQL
+		}
+		cv := s.costRunner.Check(r.Context(), evalSQL, dec.Fingerprint, rlsRes.RulesApplied, prof)
+		if cv.Evaluated {
+			costInfo = map[string]any{
+				"evaluated": true,
+				"cache_hit": cv.CacheHit,
+				"fallback":  cv.Fallback,
+				"blocked":   cv.Blocked,
+				"rule":      cv.Rule,
+				"reason":    cv.Reason,
+				"metrics":   cv.Metrics,
+			}
+			if cv.Blocked {
+				dec.Action = firewall.ActionBlock
+				dec.Rule = cv.Rule
+				dec.Reason = cv.Reason
+				dec.RiskLevel = "HIGH"
+			}
+		}
+	}
+
 	var maskedSample string
 	var entities map[string]int
 	if req.Sample != "" {
@@ -289,6 +374,9 @@ func (s *Server) handleInspect(w http.ResponseWriter, r *http.Request) {
 		resp["rewritten_sql"] = rlsRes.SQL
 		resp["rls_rules"] = rlsRes.RulesApplied
 	}
+	if costInfo != nil {
+		resp["cost_guard"] = costInfo
+	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -297,8 +385,9 @@ func (s *Server) handleInspect(w http.ResponseWriter, r *http.Request) {
 // AST blocking, row truncation, and live synchronous HITL hold/approve!
 func (s *Server) handlePlaygroundQuery(w http.ResponseWriter, r *http.Request) {
 	var req struct {
-		SQL     string `json:"sql"`
-		Profile string `json:"profile"`
+		SQL       string            `json:"sql"`
+		Profile   string            `json:"profile"`
+		JWTClaims map[string]string `json:"jwt_claims"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
@@ -314,6 +403,13 @@ func (s *Server) handlePlaygroundQuery(w http.ResponseWriter, r *http.Request) {
 		prof = s.policyMgr.MatchProfile("", req.Profile)
 	}
 	astDec := firewall.Evaluate(req.SQL, prof)
+
+	// When testing a profile that binds {{jwt.*}} claims (or explicit jwt_claims in the Playground),
+	// execute through the real MCP runtime so claim-bound AST Virtual RLS + Cost Guard + HITL are exercised end-to-end.
+	if profileUsesJWTPlaceholders(prof) || len(req.JWTClaims) > 0 {
+		s.handleMCPPlaygroundQuery(w, r, prof, astDec, req.SQL, req.JWTClaims)
+		return
+	}
 
 	cfg := s.policyMgr.Config()
 	proxyTarget := s.resolveProxyAddr()
@@ -542,11 +638,370 @@ func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id")
+		w.Header().Set("Access-Control-Expose-Headers", "Mcp-Session-Id")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		next.ServeHTTP(w, r)
+	})
+}
+
+func profileUsesJWTPlaceholders(prof *policy.RoleProfile) bool {
+	if prof == nil {
+		return false
+	}
+	for _, rf := range prof.Firewall.RowFilters {
+		if strings.Contains(rf.Predicate, "{{jwt.") {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Server) handleMCPPlaygroundQuery(
+	w http.ResponseWriter,
+	r *http.Request,
+	prof *policy.RoleProfile,
+	astDec firewall.Decision,
+	sqlStr string,
+	claims map[string]string,
+) {
+	start := time.Now()
+	sub := "playground-jwt"
+	if s := strings.TrimSpace(claims["sub"]); s != "" {
+		sub = s
+	}
+	callCtx := mcpserver.WithCallerIdentity(r.Context(), mcpserver.CallerIdentity{
+		Subject:     sub,
+		ProfileName: prof.Name,
+		Claims:      claims,
+		Source:      "mcp-http",
+		ClientAddr:  r.RemoteAddr,
+	})
+	rawParams, _ := json.Marshal(map[string]any{
+		"name":      "query",
+		"arguments": map[string]any{"sql": sqlStr},
+	})
+	rpcResp := s.mcpSrv.HandleRequest(callCtx, mcpserver.RPCRequest{
+		JSONRPC: "2.0",
+		ID:      1,
+		Method:  "tools/call",
+		Params:  rawParams,
+	})
+	elapsed := time.Since(start)
+
+	resMap, _ := rpcResp.Result.(map[string]any)
+	isErr, _ := resMap["isError"].(bool)
+	textOut := ""
+	if content, ok := resMap["content"].([]map[string]any); ok && len(content) > 0 {
+		textOut, _ = content[0]["text"].(string)
+	}
+
+	if isErr {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":      "blocked",
+			"profile":     prof.Name,
+			"decision":    astDec,
+			"error":       textOut,
+			"sqlstate":    "42501",
+			"duration_ms": float64(elapsed.Microseconds()) / 1000.0,
+		})
+		return
+	}
+
+	var parsed struct {
+		RowCount       int              `json:"row_count"`
+		Truncated      bool             `json:"truncated"`
+		PIICellsMasked int              `json:"pii_cells_masked"`
+		Rows           []map[string]any `json:"rows"`
+	}
+	_ = json.Unmarshal([]byte(textOut), &parsed)
+
+	var cols []string
+	if len(parsed.Rows) > 0 {
+		for k := range parsed.Rows[0] {
+			cols = append(cols, k)
+		}
+	}
+	resultRows := make([][]any, 0, len(parsed.Rows))
+	for _, rec := range parsed.Rows {
+		row := make([]any, len(cols))
+		for i, c := range cols {
+			row[i] = rec[c]
+		}
+		resultRows = append(resultRows, row)
+	}
+
+	var latestAudit *events.AuditEvent
+	recent := s.eventBus.Recent(5, "", prof.Name)
+	for i := range recent {
+		if recent[i].SQLFingerprint == astDec.Fingerprint {
+			latestAudit = &recent[i]
+			break
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":      "ok",
+		"profile":     prof.Name,
+		"decision":    astDec,
+		"columns":     cols,
+		"rows":        resultRows,
+		"row_count":   len(resultRows),
+		"command_tag": fmt.Sprintf("SELECT %d", len(resultRows)),
+		"duration_ms": float64(elapsed.Microseconds()) / 1000.0,
+		"audit":       latestAudit,
+	})
+}
+
+func (s *Server) handleMCPHTTP(w http.ResponseWriter, r *http.Request) {
+	if !s.policyMgr.Config().MCP.HTTPEnabled {
+		writeJSON(w, http.StatusNotFound, map[string]string{
+			"error": "Streamable HTTP MCP is disabled (enable mcp.http_enabled: true in pgveil.yaml)",
+		})
+		return
+	}
+	s.mcpSrv.HTTPHandler().ServeHTTP(w, r)
+}
+
+func (s *Server) handleSlackInteraction(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 256*1024)
+	rawBody, err := io.ReadAll(r.Body)
+	if err != nil {
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]string{"error": "payload too large"})
+		return
+	}
+
+	signingSecret := s.policyMgr.Config().Notifications.Slack.SigningSecret
+	ts := r.Header.Get("X-Slack-Request-Timestamp")
+	sig := r.Header.Get("X-Slack-Signature")
+	if err := chatops.VerifySlackSignature(signingSecret, ts, sig, rawBody, time.Now()); err != nil {
+		if s.metrics != nil && s.metrics.HITLChatOps != nil {
+			s.metrics.HITLChatOps.WithLabelValues("slack", "invalid_sig").Inc()
+		}
+		slog.Warn("rejected Slack interaction with invalid signature", "err", err)
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
+		return
+	}
+
+	vals, err := url.ParseQuery(string(rawBody))
+	if err != nil || vals.Get("payload") == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "missing form payload"})
+		return
+	}
+
+	var interaction struct {
+		User struct {
+			Username string `json:"username"`
+			Name     string `json:"name"`
+			ID       string `json:"id"`
+		} `json:"user"`
+		Actions []struct {
+			ActionID string `json:"action_id"`
+			Value    string `json:"value"`
+		} `json:"actions"`
+	}
+	if err := json.Unmarshal([]byte(vals.Get("payload")), &interaction); err != nil || len(interaction.Actions) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid Slack interaction payload"})
+		return
+	}
+
+	act := interaction.Actions[0]
+	var approve bool
+	switch act.ActionID {
+	case chatops.ActionIDApprove:
+		approve = true
+	case chatops.ActionIDDeny:
+		approve = false
+	default:
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unsupported action_id"})
+		return
+	}
+
+	reviewer := interaction.User.Username
+	if reviewer == "" {
+		reviewer = interaction.User.Name
+	}
+	if reviewer == "" {
+		reviewer = interaction.User.ID
+	}
+	reviewer = "slack:@" + reviewer
+
+	resolvedReq, resErr := s.hitlMgr.Resolve(act.Value, approve, reviewer, "Resolved via Slack Block Kit")
+	var alreadyErr *hitl.AlreadyResolvedError
+	if resErr != nil {
+		if errors.As(resErr, &alreadyErr) && alreadyErr.Request != nil {
+			writeJSON(w, http.StatusOK, chatops.BuildSlackResolvedResponse(alreadyErr.Request, true))
+			return
+		}
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": resErr.Error()})
+		return
+	}
+
+	if s.metrics != nil && s.metrics.HITLChatOps != nil {
+		ev := "denied"
+		if approve {
+			ev = "approved"
+		}
+		s.metrics.HITLChatOps.WithLabelValues("slack", ev).Inc()
+	}
+	writeJSON(w, http.StatusOK, chatops.BuildSlackResolvedResponse(resolvedReq, false))
+}
+
+// handleHITLCallbackPreview handles GET /webhooks/hitl/callback strictly as a READ-ONLY preview card.
+// Link unfurlers / email security scanners (Slack, Discord, Teams, Defender SafeLinks) can prefetch
+// this URL repeatedly without ever mutating HITL approval state.
+func (s *Server) handleHITLCallbackPreview(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimSpace(r.URL.Query().Get("id"))
+	expStr := strings.TrimSpace(r.URL.Query().Get("exp"))
+	sig := strings.TrimSpace(r.URL.Query().Get("sig"))
+
+	if err := s.chatOps.VerifyPreviewParams(id, expStr, sig, time.Now()); err != nil {
+		if s.metrics != nil && s.metrics.HITLChatOps != nil {
+			s.metrics.HITLChatOps.WithLabelValues("callback", "invalid_sig").Inc()
+		}
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
+		return
+	}
+
+	req, ok := s.hitlMgr.Get(id)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "approval request not found"})
+		return
+	}
+
+	expInt, _ := strconv.ParseInt(expStr, 10, 64)
+	approveTok := s.chatOps.SignActionToken(id, "approve", expInt)
+	denyTok := s.chatOps.SignActionToken(id, "deny", expInt)
+
+	if strings.Contains(r.Header.Get("Accept"), "application/json") && !strings.Contains(r.Header.Get("Accept"), "text/html") {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"request":       req,
+			"approve_token": approveTok,
+			"deny_token":    denyTok,
+			"exp":           expStr,
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(chatops.RenderReviewCardHTML(req, expStr, approveTok, denyTok, "")))
+}
+
+// handleHITLCallbackAction handles state-mutating POST /webhooks/hitl/callback submissions.
+func (s *Server) handleHITLCallbackAction(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
+	var id, action, expStr, token, reviewer string
+
+	ct := r.Header.Get("Content-Type")
+	if strings.Contains(ct, "application/json") {
+		var body struct {
+			ID       string `json:"id"`
+			Action   string `json:"action"`
+			Exp      string `json:"exp"`
+			Token    string `json:"token"`
+			Reviewer string `json:"reviewer"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+			return
+		}
+		id, action, expStr, token, reviewer = body.ID, body.Action, body.Exp, body.Token, body.Reviewer
+	} else {
+		if err := r.ParseForm(); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid form body"})
+			return
+		}
+		id = r.FormValue("id")
+		action = r.FormValue("action")
+		expStr = r.FormValue("exp")
+		token = r.FormValue("token")
+		reviewer = r.FormValue("reviewer")
+	}
+
+	if err := s.chatOps.VerifyActionToken(id, action, expStr, token, time.Now()); err != nil {
+		if s.metrics != nil && s.metrics.HITLChatOps != nil {
+			s.metrics.HITLChatOps.WithLabelValues("callback", "invalid_sig").Inc()
+		}
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
+		return
+	}
+
+	if reviewer == "" {
+		reviewer = "chatops-signed-callback"
+	}
+	approve := action == "approve"
+	resolvedReq, resErr := s.hitlMgr.Resolve(id, approve, reviewer, "Resolved via signed ChatOps callback")
+	notice := ""
+	var alreadyErr *hitl.AlreadyResolvedError
+	if resErr != nil {
+		if errors.As(resErr, &alreadyErr) && alreadyErr.Request != nil {
+			resolvedReq = alreadyErr.Request
+			notice = fmt.Sprintf("Request was already %s earlier by %s.", resolvedReq.Status, resolvedReq.Reviewer)
+		} else {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": resErr.Error()})
+			return
+		}
+	} else {
+		if s.metrics != nil && s.metrics.HITLChatOps != nil {
+			ev := "denied"
+			if approve {
+				ev = "approved"
+			}
+			s.metrics.HITLChatOps.WithLabelValues("callback", ev).Inc()
+		}
+		notice = fmt.Sprintf("Query %s successfully.", resolvedReq.Status)
+	}
+
+	if strings.Contains(r.Header.Get("Accept"), "application/json") && !strings.Contains(r.Header.Get("Accept"), "text/html") {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"status":  resolvedReq.Status,
+			"request": resolvedReq,
+			"notice":  notice,
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'")
+	w.Header().Set("X-Frame-Options", "DENY")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(chatops.RenderReviewCardHTML(resolvedReq, expStr, "", "", notice)))
+}
+
+func (s *Server) handleChatOpsTest(w http.ResponseWriter, r *http.Request) {
+	sample := hitl.ApprovalRequest{
+		ID:            "hitl_test_preview",
+		CreatedAt:     time.Now().UTC(),
+		ExpiresAt:     time.Now().UTC().Add(5 * time.Minute),
+		DBUser:        s.policyMgr.Config().Server.UpstreamUser,
+		Database:      s.policyMgr.Config().Server.UpstreamDatabase,
+		RoleProfile:   "ai_agent",
+		StatementType: "UPDATE",
+		RiskLevel:     "HIGH",
+		Rule:          "require_hitl_update",
+		Reason:        "ChatOps connectivity verification test",
+		SQL:           "UPDATE orders SET status = 'approved' WHERE id = 1001;",
+		Status:        hitl.StatusPending,
+	}
+	baseURL := s.policyMgr.Config().Notifications.PublicBaseURL
+	if baseURL == "" && r.Host != "" {
+		scheme := "http"
+		if r.TLS != nil {
+			scheme = "https"
+		}
+		baseURL = scheme + "://" + r.Host
+	}
+	previewURL := s.chatOps.SignPreviewURL(baseURL, sample.ID, sample.ExpiresAt)
+	s.chatOps.NotifyHITLPending(sample)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"dispatched":         s.chatOps.IsConfigured(),
+		"sample_preview_url": previewURL,
+		"slack_blocks":       chatops.BuildSlackPendingBlocks(sample, s.policyMgr.Config().Notifications.Slack.Channel, previewURL),
 	})
 }

@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -453,24 +454,7 @@ func (s *Server) executeStmt(stmt *pg_query.Node, params []*string) (*queryResul
 		return s.execDelete(x.DeleteStmt, params)
 
 	case *pg_query.Node_ExplainStmt:
-		planSQL := ""
-		if x.ExplainStmt.Query != nil {
-			if dep, err := pg_query.Deparse(&pg_query.ParseResult{
-				Stmts: []*pg_query.RawStmt{{Stmt: x.ExplainStmt.Query}},
-			}); err == nil {
-				planSQL = dep
-			}
-		}
-		rows := [][]*string{
-			{sp("pgveil Embedded Demo Plan (AST Virtual RLS & Firewall Active)")},
-			{sp("  -> Executed SQL: " + planSQL)},
-		}
-		return &queryResult{
-			fields:     []pgwire.FieldDescription{{Name: "QUERY PLAN", DataTypeOID: OIDText, DataTypeSize: -1, TypeModifier: -1}},
-			rows:       rows,
-			commandTag: "EXPLAIN",
-			hasRows:    true,
-		}, nil
+		return s.execExplain(x.ExplainStmt), nil
 
 	case *pg_query.Node_VariableShowStmt:
 		name := strings.ToLower(x.VariableShowStmt.Name)
@@ -1862,4 +1846,152 @@ func dedupeRows(rows [][]*string) [][]*string {
 		}
 	}
 	return out
+}
+
+func (s *Server) execExplain(exp *pg_query.ExplainStmt) *queryResult {
+	isJSON := false
+	for _, opt := range exp.Options {
+		de := opt.GetDefElem()
+		if de != nil && strings.EqualFold(de.Defname, "format") && de.Arg != nil {
+			if sv := de.Arg.GetString_(); sv != nil && strings.EqualFold(sv.Sval, "json") {
+				isJSON = true
+			}
+		}
+	}
+
+	planSQL := ""
+	if exp.Query != nil {
+		if dep, err := pg_query.Deparse(&pg_query.ParseResult{
+			Stmts: []*pg_query.RawStmt{{Stmt: exp.Query}},
+		}); err == nil {
+			planSQL = dep
+		}
+	}
+
+	if !isJSON {
+		rows := [][]*string{
+			{sp("pgveil Embedded Demo Plan (AST Virtual RLS & Firewall Active)")},
+			{sp("  -> Executed SQL: " + planSQL)},
+		}
+		return &queryResult{
+			fields:     []pgwire.FieldDescription{{Name: "QUERY PLAN", DataTypeOID: OIDText, DataTypeSize: -1, TypeModifier: -1}},
+			rows:       rows,
+			commandTag: "EXPLAIN",
+			hasRows:    true,
+		}
+	}
+
+	nodeType := "Seq Scan"
+	relName := "customers"
+	totalCost := 18.5
+	planRows := 40.0
+	tableCount := 0
+	hasSelectiveFilter := false
+	hasSmallLimit := false
+
+	if sel := exp.Query.GetSelectStmt(); sel != nil {
+		if sel.WhereClause != nil {
+			hasSelectiveFilter = true
+		}
+		if sel.LimitCount != nil {
+			hasSmallLimit = true
+		}
+		tableCount, relName = countSelectRelations(sel)
+	} else if upd := exp.Query.GetUpdateStmt(); upd != nil {
+		tableCount = 1 + len(upd.FromClause)
+		if upd.Relation != nil && upd.Relation.Relname != "" {
+			relName = upd.Relation.Relname
+		}
+		hasSelectiveFilter = upd.WhereClause != nil
+	} else if del := exp.Query.GetDeleteStmt(); del != nil {
+		tableCount = 1 + len(del.UsingClause)
+		if del.Relation != nil && del.Relation.Relname != "" {
+			relName = del.Relation.Relname
+		}
+		hasSelectiveFilter = del.WhereClause != nil
+	}
+
+	switch {
+	case tableCount >= 3 && !hasSmallLimit:
+		nodeType = "Nested Loop"
+		totalCost = 92400.0
+		planRows = 250000
+	case strings.Contains(strings.ToUpper(planSQL), "CROSS JOIN") && !hasSmallLimit:
+		nodeType = "Nested Loop"
+		totalCost = 88500.0
+		planRows = 200000
+	case hasSelectiveFilter || hasSmallLimit:
+		nodeType = "Index Scan"
+		totalCost = 8.45
+		planRows = 5
+	}
+
+	var childPlans []map[string]any
+	if nodeType == "Nested Loop" {
+		childPlans = []map[string]any{
+			{
+				"Node Type":     "Seq Scan",
+				"Relation Name": relName,
+				"Schema":        "public",
+				"Total Cost":    totalCost,
+				"Plan Rows":     planRows,
+			},
+		}
+	}
+	planObj := map[string]any{
+		"Node Type":     nodeType,
+		"Relation Name": relName,
+		"Schema":        "public",
+		"Startup Cost":  0.0,
+		"Total Cost":    totalCost,
+		"Plan Rows":     planRows,
+		"Plan Width":    64,
+	}
+	if len(childPlans) > 0 {
+		planObj["Plans"] = childPlans
+	}
+	jsonBytes, _ := json.MarshalIndent([]map[string]any{{"Plan": planObj}}, "", "  ")
+	return &queryResult{
+		fields:     []pgwire.FieldDescription{{Name: "QUERY PLAN", DataTypeOID: OIDText, DataTypeSize: -1, TypeModifier: -1}},
+		rows:       [][]*string{{sp(string(jsonBytes))}},
+		commandTag: "EXPLAIN",
+		hasRows:    true,
+	}
+}
+
+func countSelectRelations(sel *pg_query.SelectStmt) (int, string) {
+	count := 0
+	firstRel := "customers"
+	var walk func(n *pg_query.Node)
+	walk = func(n *pg_query.Node) {
+		if n == nil {
+			return
+		}
+		switch x := n.Node.(type) {
+		case *pg_query.Node_RangeVar:
+			if x.RangeVar != nil && x.RangeVar.Relname != "" {
+				if count == 0 {
+					firstRel = x.RangeVar.Relname
+				}
+				count++
+			}
+		case *pg_query.Node_JoinExpr:
+			walk(x.JoinExpr.Larg)
+			walk(x.JoinExpr.Rarg)
+		case *pg_query.Node_RangeSubselect:
+			if x.RangeSubselect != nil && x.RangeSubselect.Subquery != nil {
+				if sub := x.RangeSubselect.Subquery.GetSelectStmt(); sub != nil {
+					c, r := countSelectRelations(sub)
+					if count == 0 && c > 0 {
+						firstRel = r
+					}
+					count += c
+				}
+			}
+		}
+	}
+	for _, fc := range sel.FromClause {
+		walk(fc)
+	}
+	return count, firstRel
 }

@@ -81,6 +81,13 @@ func TestCLIHelpersAndSubcommands(t *testing.T) {
 		t.Fatalf("unexpected runMCPCtx output: %s", mcpOut.String())
 	}
 
+	// Test runMCPCtx in standalone Streamable HTTP mode (--http 127.0.0.1:0)
+	mcpHTTPCtx, mcpHTTPCancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer mcpHTTPCancel()
+	if err := runMCPCtx(mcpHTTPCtx, []string{"--config", demoCfgPath, "--http", "127.0.0.1:0"}, strings.NewReader(""), &mcpOut); err != nil {
+		t.Fatalf("runMCPCtx --http failed: %v", err)
+	}
+
 	// Test runDemoCtx lifecycle (bind ephemeral ports, then cancel gracefully)
 	demoCtx, demoCancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer demoCancel()

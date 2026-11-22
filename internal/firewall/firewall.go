@@ -355,6 +355,15 @@ func Evaluate(sql string, profile *policy.RoleProfile) Decision {
 		return dec
 	}
 
+	// 2c. Prevent AI agents from disabling or overriding profile max_query_duration (SET/RESET/DISCARD ALL/set_config)
+	if fw.MaxQueryDurationParsed() > 0 && analysis.hasTimeoutBypass {
+		dec.Action = ActionBlock
+		dec.RiskLevel = "HIGH"
+		dec.Rule = "block_timeout_bypass"
+		dec.Reason = fmt.Sprintf("Session timeout override (%s) is blocked because profile %q enforces max_query_duration=%s", analysis.primaryType, profile.Name, fw.MaxQueryDuration)
+		return dec
+	}
+
 	// 3. Fail-Closed DDL Blocking (includes RENAME, OWNER, DROP OWNED, FDW, SUBSCRIPTION, SELECT INTO, unknown DDL)
 	if fw.BlockDDL && analysis.isDDL {
 		dec.Action = ActionBlock

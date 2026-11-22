@@ -1,6 +1,7 @@
 package firewall
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 
@@ -8,13 +9,18 @@ import (
 	pg_query "github.com/pganalyze/pg_query_go/v6"
 )
 
-// SessionContext carries authenticated PostgreSQL session attributes available for
-// Virtual Row-Level Security (RLS) predicate placeholders such as {{db_user}} or {{application_name}}.
+// ErrMissingRLSClaim is returned when a row_filters predicate references {{jwt.<claim>}}
+// and that claim is absent or empty in the verified session identity (strict fail-closed).
+var ErrMissingRLSClaim = errors.New("missing required JWT claim for virtual RLS predicate")
+
+// SessionContext carries authenticated PostgreSQL & verified JWT attributes available for
+// Virtual Row-Level Security (RLS) predicate placeholders ({{db_user}}, {{jwt.tenant_id}}, etc.).
 type SessionContext struct {
 	DBUser          string
 	Database        string
 	ApplicationName string
 	RoleProfile     string
+	Claims          map[string]string
 }
 
 // RLSResult describes the outcome of AST-level Virtual RLS predicate injection.
@@ -25,9 +31,8 @@ type RLSResult struct {
 }
 
 type compiledRowFilter struct {
-	table       string // lowercased table or schema.table
-	predicate   string // expanded SQL predicate string
-	displayRule string // human-readable audit label
+	table   string // lowercased table or schema.table
+	rawPred string // raw policy predicate template
 }
 
 // RewriteWithRLS inspects sql using PostgreSQL 17's C AST parser, injects any matching
@@ -56,11 +61,9 @@ func RewriteWithRLS(sql string, profile *policy.RoleProfile, sess SessionContext
 		if tbl == "" || rawPred == "" {
 			continue
 		}
-		expanded := expandSessionPlaceholders(rawPred, sess)
 		filters[tbl] = append(filters[tbl], compiledRowFilter{
-			table:       tbl,
-			predicate:   expanded,
-			displayRule: fmt.Sprintf("%s: %s", tbl, expanded),
+			table:   tbl,
+			rawPred: rawPred,
 		})
 	}
 	if len(filters) == 0 {
@@ -74,6 +77,7 @@ func RewriteWithRLS(sql string, profile *policy.RoleProfile, sess SessionContext
 
 	rw := &rlsRewriter{
 		filters: filters,
+		sess:    sess,
 		applied: make(map[string]bool),
 	}
 
@@ -103,6 +107,7 @@ func RewriteWithRLS(sql string, profile *policy.RoleProfile, sess SessionContext
 
 type rlsRewriter struct {
 	filters      map[string][]compiledRowFilter
+	sess         SessionContext
 	rewritten    bool
 	applied      map[string]bool
 	appliedOrder []string
@@ -154,13 +159,13 @@ func (r *rlsRewriter) buildPredicateForRangeVar(rv *pg_query.RangeVar, cteNames 
 
 	var combined *pg_query.Node
 	for _, f := range matched {
-		expr, err := parsePredicateExpr(f.predicate)
+		expr, displayPred, err := compilePredicateAST(f.rawPred, r.sess)
 		if err != nil {
-			return nil, fmt.Errorf("compile row filter %q: %w", f.displayRule, err)
+			return nil, fmt.Errorf("compile row filter on %q: %w", f.table, err)
 		}
 		qualifyColumns(expr, qualifier, 0)
 		combined = andExpr(combined, expr)
-		r.markApplied(f.displayRule)
+		r.markApplied(fmt.Sprintf("%s: %s", f.table, displayPred))
 	}
 	return combined, nil
 }
@@ -721,19 +726,176 @@ func (r *rlsRewriter) rewriteExprSublinks(n *pg_query.Node, cteNames map[string]
 	return nil
 }
 
-func parsePredicateExpr(pred string) (*pg_query.Node, error) {
-	tree, err := pg_query.Parse("SELECT 1 WHERE " + pred)
+// compilePredicateAST parses a row_filters predicate using sentinel placeholders (__pgveil_ph_N__)
+// and injects untrusted session / JWT claim values directly into parsed pg_query.A_Const AST nodes.
+// Because untrusted claim values never touch the SQL lexer prior to pg_query.Parse, second-order
+// SQL injection (via dollar-quotes, C-escapes, comments, or quote breakout) is structurally impossible.
+type sentinelBinding struct {
+	token string
+	value string
+}
+
+func compilePredicateAST(rawPred string, sess SessionContext) (*pg_query.Node, string, error) {
+	var bindings []sentinelBinding
+	var templated strings.Builder
+	templated.Grow(len(rawPred) + 32)
+
+	inQuote := false
+	for i := 0; i < len(rawPred); {
+		if rawPred[i] == '\'' {
+			templated.WriteByte('\'')
+			if inQuote && i+1 < len(rawPred) && rawPred[i+1] == '\'' {
+				templated.WriteByte('\'')
+				i += 2
+				continue
+			}
+			inQuote = !inQuote
+			i++
+			continue
+		}
+		if strings.HasPrefix(rawPred[i:], "{{") {
+			if end := strings.Index(rawPred[i:], "}}"); end > 2 {
+				key := strings.TrimSpace(rawPred[i+2 : i+end])
+				val, err := resolvePlaceholderValue(key, sess)
+				if err != nil {
+					return nil, "", err
+				}
+				tok := fmt.Sprintf("__pgveil_ph_%d__", len(bindings))
+				bindings = append(bindings, sentinelBinding{
+					token: tok,
+					value: strings.ReplaceAll(val, "\x00", ""),
+				})
+				if inQuote {
+					templated.WriteString(tok)
+				} else {
+					templated.WriteByte('\'')
+					templated.WriteString(tok)
+					templated.WriteByte('\'')
+				}
+				i += end + 2
+				continue
+			}
+		}
+		templated.WriteByte(rawPred[i])
+		i++
+	}
+
+	tree, err := pg_query.Parse("SELECT 1 WHERE " + templated.String())
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if len(tree.Stmts) != 1 || tree.Stmts[0].Stmt == nil {
-		return nil, fmt.Errorf("predicate must parse to a single expression")
+		return nil, "", fmt.Errorf("predicate must parse to a single expression")
 	}
 	sel := tree.Stmts[0].Stmt.GetSelectStmt()
 	if sel == nil || sel.WhereClause == nil {
-		return nil, fmt.Errorf("predicate missing WHERE expression")
+		return nil, "", fmt.Errorf("predicate missing WHERE expression")
 	}
-	return sel.WhereClause, nil
+
+	if len(bindings) > 0 {
+		injectSentinelASTValues(sel.WhereClause, bindings, 0)
+	}
+
+	displayPred := rawPred
+	if dep, derr := pg_query.Deparse(tree); derr == nil {
+		const pfx = "SELECT 1 WHERE "
+		if strings.HasPrefix(dep, pfx) {
+			displayPred = strings.TrimPrefix(dep, pfx)
+		} else {
+			displayPred = dep
+		}
+	}
+	return sel.WhereClause, displayPred, nil
+}
+
+func resolvePlaceholderValue(key string, sess SessionContext) (string, error) {
+	switch key {
+	case "db_user":
+		return sess.DBUser, nil
+	case "database":
+		return sess.Database, nil
+	case "application_name":
+		return sess.ApplicationName, nil
+	case "profile":
+		return sess.RoleProfile, nil
+	default:
+		if strings.HasPrefix(key, "jwt.") {
+			claim := strings.TrimPrefix(key, "jwt.")
+			if claim == "" || sess.Claims == nil {
+				return "", fmt.Errorf("%w: {{%s}}", ErrMissingRLSClaim, key)
+			}
+			val, ok := sess.Claims[claim]
+			if !ok || strings.TrimSpace(val) == "" {
+				return "", fmt.Errorf("%w: {{%s}}", ErrMissingRLSClaim, key)
+			}
+			return val, nil
+		}
+		return "", fmt.Errorf("unsupported RLS placeholder {{%s}}", key)
+	}
+}
+
+func injectSentinelASTValues(n *pg_query.Node, bindings []sentinelBinding, depth int) {
+	if n == nil || depth > 64 {
+		return
+	}
+	d := depth + 1
+	switch x := n.Node.(type) {
+	case *pg_query.Node_AConst:
+		if sv := x.AConst.GetSval(); sv != nil {
+			for _, b := range bindings {
+				if strings.Contains(sv.Sval, b.token) {
+					sv.Sval = strings.ReplaceAll(sv.Sval, b.token, b.value)
+				}
+			}
+		}
+	case *pg_query.Node_BoolExpr:
+		for _, a := range x.BoolExpr.Args {
+			injectSentinelASTValues(a, bindings, d)
+		}
+	case *pg_query.Node_AExpr:
+		injectSentinelASTValues(x.AExpr.Lexpr, bindings, d)
+		injectSentinelASTValues(x.AExpr.Rexpr, bindings, d)
+	case *pg_query.Node_FuncCall:
+		for _, a := range x.FuncCall.Args {
+			injectSentinelASTValues(a, bindings, d)
+		}
+		injectSentinelASTValues(x.FuncCall.AggFilter, bindings, d)
+	case *pg_query.Node_TypeCast:
+		injectSentinelASTValues(x.TypeCast.Arg, bindings, d)
+	case *pg_query.Node_NullTest:
+		injectSentinelASTValues(x.NullTest.Arg, bindings, d)
+	case *pg_query.Node_BooleanTest:
+		injectSentinelASTValues(x.BooleanTest.Arg, bindings, d)
+	case *pg_query.Node_CoalesceExpr:
+		for _, a := range x.CoalesceExpr.Args {
+			injectSentinelASTValues(a, bindings, d)
+		}
+	case *pg_query.Node_MinMaxExpr:
+		for _, a := range x.MinMaxExpr.Args {
+			injectSentinelASTValues(a, bindings, d)
+		}
+	case *pg_query.Node_CaseExpr:
+		injectSentinelASTValues(x.CaseExpr.Arg, bindings, d)
+		for _, w := range x.CaseExpr.Args {
+			injectSentinelASTValues(w, bindings, d)
+		}
+		injectSentinelASTValues(x.CaseExpr.Defresult, bindings, d)
+	case *pg_query.Node_CaseWhen:
+		injectSentinelASTValues(x.CaseWhen.Expr, bindings, d)
+		injectSentinelASTValues(x.CaseWhen.Result, bindings, d)
+	case *pg_query.Node_List:
+		for _, it := range x.List.Items {
+			injectSentinelASTValues(it, bindings, d)
+		}
+	case *pg_query.Node_AArrayExpr:
+		for _, el := range x.AArrayExpr.Elements {
+			injectSentinelASTValues(el, bindings, d)
+		}
+	case *pg_query.Node_RowExpr:
+		for _, el := range x.RowExpr.Args {
+			injectSentinelASTValues(el, bindings, d)
+		}
+	}
 }
 
 // qualifyColumns prepends table/alias qualifiers to every unqualified ColumnRef inside a row filter
@@ -818,63 +980,4 @@ func cloneStringBoolMap(in map[string]bool) map[string]bool {
 		out[k] = v
 	}
 	return out
-}
-
-// expandSessionPlaceholders replaces {{db_user}}, {{database}}, {{application_name}}, and {{profile}}
-// safely with single-quote SQL literal escaping so crafted session strings can never break out of quotes.
-func expandSessionPlaceholders(pred string, sess SessionContext) string {
-	if !strings.Contains(pred, "{{") {
-		return pred
-	}
-	vars := map[string]string{
-		"{{db_user}}":          sanitizeSessionVal(sess.DBUser),
-		"{{database}}":         sanitizeSessionVal(sess.Database),
-		"{{application_name}}": sanitizeSessionVal(sess.ApplicationName),
-		"{{profile}}":          sanitizeSessionVal(sess.RoleProfile),
-	}
-
-	var out strings.Builder
-	out.Grow(len(pred) + 32)
-	inQuote := false
-	for i := 0; i < len(pred); {
-		if pred[i] == '\'' {
-			out.WriteByte('\'')
-			if inQuote && i+1 < len(pred) && pred[i+1] == '\'' {
-				out.WriteByte('\'')
-				i += 2
-				continue
-			}
-			inQuote = !inQuote
-			i++
-			continue
-		}
-		if pred[i] == '{' && i+1 < len(pred) && pred[i+1] == '{' {
-			matched := false
-			for ph, val := range vars {
-				if strings.HasPrefix(pred[i:], ph) {
-					if inQuote {
-						out.WriteString(val)
-					} else {
-						out.WriteByte('\'')
-						out.WriteString(val)
-						out.WriteByte('\'')
-					}
-					i += len(ph)
-					matched = true
-					break
-				}
-			}
-			if matched {
-				continue
-			}
-		}
-		out.WriteByte(pred[i])
-		i++
-	}
-	return out.String()
-}
-
-func sanitizeSessionVal(v string) string {
-	v = strings.ReplaceAll(v, "\x00", "")
-	return strings.ReplaceAll(v, "'", "''")
 }

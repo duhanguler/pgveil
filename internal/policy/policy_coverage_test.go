@@ -146,6 +146,12 @@ func TestPolicyValidationErrors(t *testing.T) {
 		{"subquery_in_func", "profiles:\n  - name: a\n    firewall:\n      row_filters:\n        - table: customers\n          predicate: \"lower((SELECT 'a')) = 'a'\""},
 		{"subquery_in_array", "profiles:\n  - name: a\n    firewall:\n      row_filters:\n        - table: customers\n          predicate: \"id = ANY(ARRAY[(SELECT 1)])\""},
 		{"subquery_in_list", "profiles:\n  - name: a\n    firewall:\n      row_filters:\n        - table: customers\n          predicate: \"id IN ((SELECT 1), 2)\""},
+		{"bad_max_query_duration", "profiles:\n  - name: a\n    firewall:\n      max_query_duration: \"-5s\""},
+		{"neg_cost_guard", "profiles:\n  - name: a\n    firewall:\n      cost_guard:\n        max_total_cost: -1"},
+		{"unknown_allowed_profile", "mcp:\n  auth:\n    allowed_profiles: [\"missing\"]\nprofiles:\n  - name: a"},
+		{"unknown_apikey_profile", "mcp:\n  auth:\n    api_keys:\n      - name: k1\n        token: t1\n        profile: missing\nprofiles:\n  - name: a"},
+		{"bad_jwt_placeholder", "profiles:\n  - name: a\n    firewall:\n      row_filters:\n        - table: customers\n          predicate: \"city = {{jwt.bad key!}}\""},
+		{"unknown_placeholder", "profiles:\n  - name: a\n    firewall:\n      row_filters:\n        - table: customers\n          predicate: \"city = {{unknown_var}}\""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -153,5 +159,63 @@ func TestPolicyValidationErrors(t *testing.T) {
 				t.Fatalf("expected validation error for %s", tc.name)
 			}
 		})
+	}
+}
+
+func TestPolicyV050EnvOverridesAndRedactedSecretPreservation(t *testing.T) {
+	t.Setenv("PGVEIL_MCP_HTTP_ENABLED", "true")
+	t.Setenv("PGVEIL_MCP_JWT_SECRET", "env-jwt-secret")
+	t.Setenv("PGVEIL_MCP_JWKS_URL", "https://idp.example/jwks.json")
+	t.Setenv("PGVEIL_PUBLIC_BASE_URL", "https://pgveil.example")
+	t.Setenv("PGVEIL_HITL_CALLBACK_SECRET", "env-cb-secret")
+	t.Setenv("PGVEIL_SLACK_BOT_TOKEN", "env-bot-tok")
+	t.Setenv("PGVEIL_SLACK_SIGNING_SECRET", "env-sign-sec")
+	t.Setenv("PGVEIL_SLACK_CHANNEL", "#approvals")
+	t.Setenv("PGVEIL_SLACK_WEBHOOK_URL", "https://hooks.example/slack")
+	t.Setenv("PGVEIL_WEBHOOK_URL", "https://hooks.example/generic")
+
+	yml := `
+mcp:
+  auth:
+    jwt_secret: "orig-jwt"
+    api_keys:
+      - name: "runner"
+        token: "orig-api-tok"
+        profile: "a"
+notifications:
+  callback_secret: "orig-cb"
+  slack:
+    bot_token: "orig-bot"
+    signing_secret: "orig-sign"
+    webhook_url: "https://orig.example/slack"
+profiles:
+  - name: a
+    firewall:
+      max_query_duration: "5s"
+      row_filters:
+        - table: customers
+          predicate: "city = '{{jwt.city}}' AND email LIKE '%@{{jwt.domain}}'"
+`
+	mgr, err := LoadBytes([]byte(yml))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if mgr.Version() != 1 || !mgr.Config().MCP.HTTPEnabled || mgr.Config().Profiles[0].Firewall.MaxQueryDurationParsed() == 0 {
+		t.Fatalf("unexpected v0.5.0 config state: %+v", mgr.Config())
+	}
+
+	// Clear env vars so ReloadBytes tests RedactedPlaceholder preservation directly
+	for _, k := range []string{
+		"PGVEIL_MCP_JWT_SECRET", "PGVEIL_HITL_CALLBACK_SECRET",
+		"PGVEIL_SLACK_BOT_TOKEN", "PGVEIL_SLACK_SIGNING_SECRET", "PGVEIL_SLACK_WEBHOOK_URL",
+	} {
+		t.Setenv(k, "")
+	}
+	redacted, _ := mgr.RedactedYAML()
+	if err := mgr.ReloadBytes([]byte(redacted)); err != nil {
+		t.Fatalf("ReloadBytes on RedactedYAML failed: %v", err)
+	}
+	if mgr.Version() != 2 || len(mgr.Config().MCP.Auth.APIKeys) != 1 || mgr.Config().MCP.Auth.APIKeys[0].Token != "orig-api-tok" {
+		t.Fatalf("expected API key token preserved across redacted reload, got %+v", mgr.Config().MCP.Auth.APIKeys)
 	}
 }

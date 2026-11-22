@@ -20,6 +20,24 @@ server:
 notifications:
   # Optional Slack / Teams / Discord webhook URL for live HITL prompts and CRITICAL blocks.
   webhook_url: ""
+  public_base_url: ""   # Override via PGVEIL_PUBLIC_BASE_URL for signed unfurler-safe HITL review links
+  callback_secret: ""   # Override via PGVEIL_HITL_CALLBACK_SECRET (defaults to HKDF-derived masking_secret)
+  slack:
+    bot_token: ""       # Override via PGVEIL_SLACK_BOT_TOKEN
+    signing_secret: ""  # Override via PGVEIL_SLACK_SIGNING_SECRET (verifies X-Slack-Signature HMAC-SHA256)
+    channel: ""         # Override via PGVEIL_SLACK_CHANNEL (e.g. "#db-approvals")
+    webhook_url: ""     # Override via PGVEIL_SLACK_WEBHOOK_URL
+
+mcp:
+  # Streamable HTTP MCP (2025-03-26 spec) exposed at /mcp on the Control Plane or via `pgveil mcp --http :8090`
+  http_enabled: false
+  allowed_origins: []
+  auth:
+    enabled: false
+    jwt_secret: ""      # Override via PGVEIL_MCP_JWT_SECRET (HS256)
+    jwks_url: ""        # Override via PGVEIL_MCP_JWKS_URL (RS256 / ES256 coalesced JWKS cache)
+    role_claim: "role"
+    allowed_profiles: ["ai_agent", "tenant_tr", "analyst"]
 
 security:
   # HMAC secret for deterministic JOIN-preserving pseudonymization (`hash` / `fake` strategies).
@@ -87,6 +105,12 @@ profiles:
       max_rows: 25
       max_rows_action: "truncate" # "truncate" caps DataRows + emits Notice; "block" aborts with SQLSTATE 42501
       block_select_star_on_pii_tables: false
+      max_query_duration: "5s"    # Injected as startup SET statement_timeout + AST GUC bypass lock
+      cost_guard:
+        enabled: false            # Set true to run sideband read-only EXPLAIN (FORMAT JSON) + Plan LRU cache
+        max_total_cost: 50000
+        max_estimated_rows: 100000
+        fail_closed: false
       rate_limit:
         max_queries_per_minute: 0 # Set e.g. 120 in production to cap runaway AI agent request volume
         loop_threshold: 0         # Set e.g. 15 to break stuck identical-query agent loops

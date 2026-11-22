@@ -17,6 +17,7 @@ type astAnalysis struct {
 	hasCopyOut        bool
 	hasDoBlock        bool
 	hasRoleEscalation bool
+	hasTimeoutBypass  bool
 	hasSelectStar     bool
 	depthExceeded     bool
 }
@@ -381,6 +382,10 @@ func analyzeAST(tree *pg_query.ParseResult) astAnalysis {
 				inner.VariableSetStmt.Kind == pg_query.VariableSetKind_VAR_RESET_ALL {
 				res.hasRoleEscalation = true
 			}
+			if vname == "statement_timeout" || vname == "lock_timeout" ||
+				inner.VariableSetStmt.Kind == pg_query.VariableSetKind_VAR_RESET_ALL {
+				res.hasTimeoutBypass = true
+			}
 
 		case *pg_query.Node_PrepareStmt:
 			addType("PREPARE")
@@ -438,6 +443,9 @@ func analyzeAST(tree *pg_query.ParseResult) astAnalysis {
 
 		case *pg_query.Node_DiscardStmt:
 			addType("DISCARD")
+			if inner.DiscardStmt.Target == pg_query.DiscardMode_DISCARD_ALL {
+				res.hasTimeoutBypass = true
+			}
 
 		// Sub-clauses & expression nodes
 		case *pg_query.Node_CommonTableExpr:
@@ -487,6 +495,21 @@ func analyzeAST(tree *pg_query.ParseResult) astAnalysis {
 
 		case *pg_query.Node_FuncCall:
 			addFunc(inner.FuncCall)
+			if len(inner.FuncCall.Funcname) > 0 {
+				if fn := inner.FuncCall.Funcname[len(inner.FuncCall.Funcname)-1].GetString_(); fn != nil && strings.EqualFold(fn.Sval, "set_config") {
+					if len(inner.FuncCall.Args) > 0 {
+						if ac := inner.FuncCall.Args[0].GetAConst(); ac != nil && ac.GetSval() != nil {
+							guc := strings.ToLower(strings.TrimSpace(ac.GetSval().Sval))
+							if guc == "statement_timeout" || guc == "lock_timeout" {
+								res.hasTimeoutBypass = true
+							}
+						} else {
+							// Non-constant GUC name passed to set_config: treat as potential timeout bypass
+							res.hasTimeoutBypass = true
+						}
+					}
+				}
+			}
 			for _, arg := range inner.FuncCall.Args {
 				walkNode(arg, d)
 			}

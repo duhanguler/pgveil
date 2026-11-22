@@ -19,12 +19,13 @@ import (
 // RedactedPlaceholder replaces sensitive config secrets in Control Plane API responses.
 const RedactedPlaceholder = "__PGVEIL_REDACTED__"
 
-var secretYAMLLineRe = regexp.MustCompile(`(?m)^(\s*(?:upstream_password|masking_secret|admin_token|webhook_url)\s*:\s*)(.+?)(\s*(?:#.*)?)$`)
+var secretYAMLLineRe = regexp.MustCompile(`(?m)^(\s*-?\s*(?:upstream_password|masking_secret|admin_token|webhook_url|jwt_secret|callback_secret|bot_token|signing_secret|token)\s*:\s*)(.+?)(\s*(?:#.*)?)$`)
 
 // Config is the root pgveil runtime and policy configuration.
 type Config struct {
 	Server         ServerConfig        `yaml:"server" json:"server"`
 	Security       SecurityConfig      `yaml:"security" json:"security"`
+	MCP            MCPConfig           `yaml:"mcp" json:"mcp"`
 	Notifications  NotificationsConfig `yaml:"notifications" json:"notifications"`
 	Telemetry      TelemetryConfig     `yaml:"telemetry" json:"telemetry"`
 	Kafka          KafkaConfig         `yaml:"kafka" json:"kafka"`
@@ -32,8 +33,43 @@ type Config struct {
 	Profiles       []RoleProfile       `yaml:"profiles" json:"profiles"`
 }
 
+type MCPConfig struct {
+	HTTPEnabled    bool          `yaml:"http_enabled" json:"http_enabled"`
+	AllowedOrigins []string      `yaml:"allowed_origins" json:"allowed_origins,omitempty"`
+	Auth           MCPAuthConfig `yaml:"auth" json:"auth"`
+}
+
+type MCPAuthConfig struct {
+	Enabled         bool              `yaml:"enabled" json:"enabled"`
+	JWTSecret       string            `yaml:"jwt_secret" json:"-"`
+	JWKSURL         string            `yaml:"jwks_url" json:"jwks_url,omitempty"`
+	PublicKeyPEM    string            `yaml:"public_key_pem" json:"public_key_pem,omitempty"`
+	Issuer          string            `yaml:"issuer" json:"issuer,omitempty"`
+	Audience        string            `yaml:"audience" json:"audience,omitempty"`
+	RoleClaim       string            `yaml:"role_claim" json:"role_claim,omitempty"`
+	AllowedProfiles []string          `yaml:"allowed_profiles" json:"allowed_profiles,omitempty"`
+	APIKeys         []MCPAPIKeyConfig `yaml:"api_keys" json:"-"`
+}
+
+type MCPAPIKeyConfig struct {
+	Name    string            `yaml:"name" json:"name"`
+	Token   string            `yaml:"token" json:"-"`
+	Profile string            `yaml:"profile" json:"profile"`
+	Claims  map[string]string `yaml:"claims" json:"claims,omitempty"`
+}
+
 type NotificationsConfig struct {
-	WebhookURL string `yaml:"webhook_url" json:"webhook_url,omitempty"`
+	WebhookURL     string      `yaml:"webhook_url" json:"webhook_url,omitempty"`
+	PublicBaseURL  string      `yaml:"public_base_url" json:"public_base_url,omitempty"`
+	CallbackSecret string      `yaml:"callback_secret" json:"-"`
+	Slack          SlackConfig `yaml:"slack" json:"slack"`
+}
+
+type SlackConfig struct {
+	BotToken      string `yaml:"bot_token" json:"-"`
+	SigningSecret string `yaml:"signing_secret" json:"-"`
+	Channel       string `yaml:"channel" json:"channel,omitempty"`
+	WebhookURL    string `yaml:"webhook_url" json:"-"`
 }
 
 type ServerConfig struct {
@@ -117,6 +153,14 @@ type RowFilterPolicy struct {
 	Predicate string `yaml:"predicate" json:"predicate"`
 }
 
+type CostGuardPolicy struct {
+	Enabled            bool     `yaml:"enabled" json:"enabled"`
+	MaxTotalCost       float64  `yaml:"max_total_cost" json:"max_total_cost"`
+	MaxEstimatedRows   int64    `yaml:"max_estimated_rows" json:"max_estimated_rows"`
+	BlockSeqScanTables []string `yaml:"block_seq_scan_tables" json:"block_seq_scan_tables,omitempty"`
+	FailClosed         bool     `yaml:"fail_closed" json:"fail_closed"`
+}
+
 type FirewallPolicy struct {
 	AllowStatements         []string          `yaml:"allow_statements" json:"allow_statements"`
 	BlockDDL                bool              `yaml:"block_ddl" json:"block_ddl"`
@@ -135,7 +179,21 @@ type FirewallPolicy struct {
 	MaxRows                 int               `yaml:"max_rows" json:"max_rows"`
 	MaxRowsAction           string            `yaml:"max_rows_action" json:"max_rows_action"`
 	BlockSelectStarOnPII    bool              `yaml:"block_select_star_on_pii_tables" json:"block_select_star_on_pii_tables"`
+	MaxQueryDuration        string            `yaml:"max_query_duration" json:"max_query_duration,omitempty"`
+	CostGuard               CostGuardPolicy   `yaml:"cost_guard" json:"cost_guard"`
 	RateLimit               RateLimitPolicy   `yaml:"rate_limit" json:"rate_limit"`
+}
+
+// MaxQueryDurationParsed returns the configured per-query timeout duration (or 0 if disabled).
+func (f FirewallPolicy) MaxQueryDurationParsed() time.Duration {
+	if strings.TrimSpace(f.MaxQueryDuration) == "" {
+		return 0
+	}
+	d, err := time.ParseDuration(strings.TrimSpace(f.MaxQueryDuration))
+	if err != nil || d <= 0 {
+		return 0
+	}
+	return d
 }
 
 // LoopWindowDuration returns the parsed runaway-loop detection window.
@@ -327,6 +385,13 @@ func (m *Manager) Config() *Config {
 	return m.cfg
 }
 
+// Version returns the monotonically increasing configuration version counter.
+func (m *Manager) Version() int64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.version
+}
+
 // RawYAML returns the active YAML source text and version counter.
 func (m *Manager) RawYAML() (string, int64) {
 	m.mu.RLock()
@@ -419,6 +484,31 @@ func parseAndCompileWithPrev(data []byte, prev *Config) (*Config, error) {
 		if cfg.Notifications.WebhookURL == RedactedPlaceholder {
 			cfg.Notifications.WebhookURL = prev.Notifications.WebhookURL
 		}
+		if cfg.Notifications.CallbackSecret == RedactedPlaceholder {
+			cfg.Notifications.CallbackSecret = prev.Notifications.CallbackSecret
+		}
+		if cfg.Notifications.Slack.BotToken == RedactedPlaceholder {
+			cfg.Notifications.Slack.BotToken = prev.Notifications.Slack.BotToken
+		}
+		if cfg.Notifications.Slack.SigningSecret == RedactedPlaceholder {
+			cfg.Notifications.Slack.SigningSecret = prev.Notifications.Slack.SigningSecret
+		}
+		if cfg.Notifications.Slack.WebhookURL == RedactedPlaceholder {
+			cfg.Notifications.Slack.WebhookURL = prev.Notifications.Slack.WebhookURL
+		}
+		if cfg.MCP.Auth.JWTSecret == RedactedPlaceholder {
+			cfg.MCP.Auth.JWTSecret = prev.MCP.Auth.JWTSecret
+		}
+		for i := range cfg.MCP.Auth.APIKeys {
+			if cfg.MCP.Auth.APIKeys[i].Token == RedactedPlaceholder {
+				for _, pk := range prev.MCP.Auth.APIKeys {
+					if pk.Name == cfg.MCP.Auth.APIKeys[i].Name {
+						cfg.MCP.Auth.APIKeys[i].Token = pk.Token
+						break
+					}
+				}
+			}
+		}
 	}
 	applyEnvOverrides(&cfg)
 	applyDefaults(&cfg)
@@ -491,6 +581,38 @@ func applyEnvOverrides(cfg *Config) {
 	if v := os.Getenv("PGVEIL_ALERT_WEBHOOK"); v != "" {
 		cfg.Notifications.WebhookURL = v
 	}
+	if v := os.Getenv("PGVEIL_WEBHOOK_URL"); v != "" {
+		cfg.Notifications.WebhookURL = v
+	}
+	if v := os.Getenv("PGVEIL_PUBLIC_BASE_URL"); v != "" {
+		cfg.Notifications.PublicBaseURL = v
+	}
+	if v := os.Getenv("PGVEIL_HITL_CALLBACK_SECRET"); v != "" {
+		cfg.Notifications.CallbackSecret = v
+	}
+	if v := os.Getenv("PGVEIL_SLACK_BOT_TOKEN"); v != "" {
+		cfg.Notifications.Slack.BotToken = v
+	}
+	if v := os.Getenv("PGVEIL_SLACK_SIGNING_SECRET"); v != "" {
+		cfg.Notifications.Slack.SigningSecret = v
+	}
+	if v := os.Getenv("PGVEIL_SLACK_CHANNEL"); v != "" {
+		cfg.Notifications.Slack.Channel = v
+	}
+	if v := os.Getenv("PGVEIL_SLACK_WEBHOOK_URL"); v != "" {
+		cfg.Notifications.Slack.WebhookURL = v
+	}
+	if v := os.Getenv("PGVEIL_MCP_HTTP_ENABLED"); v == "true" || v == "1" {
+		cfg.MCP.HTTPEnabled = true
+	} else if v == "false" || v == "0" {
+		cfg.MCP.HTTPEnabled = false
+	}
+	if v := os.Getenv("PGVEIL_MCP_JWT_SECRET"); v != "" {
+		cfg.MCP.Auth.JWTSecret = v
+	}
+	if v := os.Getenv("PGVEIL_MCP_JWKS_URL"); v != "" {
+		cfg.MCP.Auth.JWKSURL = v
+	}
 	if v := os.Getenv("PGVEIL_UPSTREAM_TLS"); v == "true" || v == "1" {
 		cfg.Server.UpstreamTLS.Enabled = true
 	}
@@ -560,10 +682,28 @@ func (c *Config) Validate() error {
 		if p.Firewall.HITLMode != "hold" && p.Firewall.HITLMode != "reject" {
 			return fmt.Errorf("profile %q: invalid hitl_mode %q (must be hold or reject)", p.Name, p.Firewall.HITLMode)
 		}
+		if mqd := strings.TrimSpace(p.Firewall.MaxQueryDuration); mqd != "" {
+			if d, err := time.ParseDuration(mqd); err != nil || d <= 0 {
+				return fmt.Errorf("profile %q: invalid max_query_duration %q (must be positive duration like 5s)", p.Name, mqd)
+			}
+		}
+		if p.Firewall.CostGuard.MaxTotalCost < 0 || p.Firewall.CostGuard.MaxEstimatedRows < 0 {
+			return fmt.Errorf("profile %q: cost_guard thresholds cannot be negative", p.Name)
+		}
 		for idx, rf := range p.Firewall.RowFilters {
 			if err := validateRowFilter(rf); err != nil {
 				return fmt.Errorf("profile %q: row_filters[%d]: %w", p.Name, idx, err)
 			}
+		}
+	}
+	for _, ap := range c.MCP.Auth.AllowedProfiles {
+		if !seen[ap] {
+			return fmt.Errorf("mcp.auth.allowed_profiles references unknown profile %q", ap)
+		}
+	}
+	for _, ak := range c.MCP.Auth.APIKeys {
+		if ak.Profile != "" && !seen[ak.Profile] {
+			return fmt.Errorf("mcp.auth.api_keys[%q] references unknown profile %q", ak.Name, ak.Profile)
 		}
 	}
 	if c.DefaultProfile != "" && !seen[c.DefaultProfile] {

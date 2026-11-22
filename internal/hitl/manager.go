@@ -38,10 +38,31 @@ type ApprovalRequest struct {
 	Tables          []string  `json:"tables"`
 	SQL             string    `json:"sql"`
 	Status          Status    `json:"status"`
-	Reviewer        string    `json:"reviewer,omitempty"`
-	ReviewerNote    string    `json:"reviewer_note,omitempty"`
+	Reviewer        string     `json:"reviewer,omitempty"`
+	ReviewerNote    string     `json:"reviewer_note,omitempty"`
+	ActorKey        string     `json:"-"`
 
 	ch chan Status
+}
+
+const (
+	DefaultMaxPendingGlobal   = 128
+	DefaultMaxPendingPerActor = 4
+)
+
+var ErrHITLQuotaExceeded = errors.New("concurrent HITL pending approval quota exceeded")
+
+// AlreadyResolvedError is returned when a second operator attempts to resolve an approval
+// that was already approved, denied, or expired on another channel (e.g. Web vs Slack).
+type AlreadyResolvedError struct {
+	Request *ApprovalRequest
+}
+
+func (e *AlreadyResolvedError) Error() string {
+	if e == nil || e.Request == nil {
+		return "approval request already resolved"
+	}
+	return fmt.Sprintf("approval request %q already resolved (%s by %s)", e.Request.ID, e.Request.Status, e.Request.Reviewer)
 }
 
 // Manager coordinates live synchronous query holds and operator approvals/denials.
@@ -68,10 +89,40 @@ func NewManager(maxHistory int) *Manager {
 
 // Create registers a new pending approval request (used in both "hold" and "reject" modes).
 func (m *Manager) Create(req ApprovalRequest, timeout time.Duration) *ApprovalRequest {
+	stored, _ := m.CreateWithQuota(req, timeout, 0, 0)
+	return stored
+}
+
+// CreateWithQuota enforces bounded global and per-actor pending hold quotas to prevent
+// goroutine/socket exhaustion DoS when runaway agents trigger hold-mode HITL.
+func (m *Manager) CreateWithQuota(req ApprovalRequest, timeout time.Duration, maxGlobal, maxPerActor int) (*ApprovalRequest, error) {
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
 	now := time.Now().UTC()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if maxGlobal > 0 || maxPerActor > 0 {
+		globalPending := 0
+		actorPending := 0
+		for _, r := range m.requests {
+			if r.Status == StatusPending {
+				globalPending++
+				if req.ActorKey != "" && r.ActorKey == req.ActorKey {
+					actorPending++
+				}
+			}
+		}
+		if maxGlobal > 0 && globalPending >= maxGlobal {
+			return nil, fmt.Errorf("%w: global limit %d reached", ErrHITLQuotaExceeded, maxGlobal)
+		}
+		if maxPerActor > 0 && req.ActorKey != "" && actorPending >= maxPerActor {
+			return nil, fmt.Errorf("%w: actor %q has %d pending holds (max %d)", ErrHITLQuotaExceeded, req.ActorKey, actorPending, maxPerActor)
+		}
+	}
+
 	req.ID = generateID()
 	req.CreatedAt = now
 	req.ExpiresAt = now.Add(timeout)
@@ -79,7 +130,6 @@ func (m *Manager) Create(req ApprovalRequest, timeout time.Duration) *ApprovalRe
 	req.ch = make(chan Status, 1)
 
 	stored := &req
-	m.mu.Lock()
 	m.requests[stored.ID] = stored
 	m.order = append(m.order, stored.ID)
 	if len(m.order) > m.maxHistory {
@@ -90,8 +140,21 @@ func (m *Manager) Create(req ApprovalRequest, timeout time.Duration) *ApprovalRe
 		}
 	}
 	m.broadcastLocked(*stored)
-	m.mu.Unlock()
-	return stored
+	cp := *stored
+	return &cp, nil
+}
+
+// Get returns an immutable snapshot of an approval request by ID without mutating state
+// (used by idempotent GET preview cards).
+func (m *Manager) Get(id string) (*ApprovalRequest, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	req, ok := m.requests[id]
+	if !ok {
+		return nil, false
+	}
+	cp := *req
+	return &cp, true
 }
 
 // Wait blocks until an operator approves/denies the request, the timeout elapses, or ctx is canceled.
@@ -107,6 +170,9 @@ func (m *Manager) Wait(ctx context.Context, req *ApprovalRequest) (Status, strin
 	case st := <-req.ch:
 		m.mu.RLock()
 		note := req.ReviewerNote
+		if cur, ok := m.requests[req.ID]; ok {
+			note = cur.ReviewerNote
+		}
 		m.mu.RUnlock()
 		return st, note
 	case <-timer.C:
@@ -125,10 +191,11 @@ func (m *Manager) Resolve(id string, approve bool, reviewer, note string) (*Appr
 
 	req, ok := m.requests[id]
 	if !ok {
-		return nil, fmt.Errorf("approval request %q not found", id)
+		return nil, fmt.Errorf("%w: %q", ErrNotFound, id)
 	}
 	if req.Status != StatusPending {
-		return nil, fmt.Errorf("approval request %q already resolved (%s)", id, req.Status)
+		cp := *req
+		return &cp, &AlreadyResolvedError{Request: &cp}
 	}
 	now := time.Now().UTC()
 	req.ResolvedAt = &now

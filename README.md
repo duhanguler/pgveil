@@ -7,7 +7,7 @@
   <a href="https://codecov.io/gh/duhanguler/pgveil"><img src="https://codecov.io/gh/duhanguler/pgveil/graph/badge.svg" alt="Codecov" /></a>
   <a href="https://pkg.go.dev/github.com/duhanguler/pgveil"><img src="https://pkg.go.dev/badge/github.com/duhanguler/pgveil.svg" alt="Go Reference" /></a>
   <a href="https://mcpservers.org/servers/duhanguler/pgveil"><img src="https://mcpservers.org/badge.svg" alt="Listed on mcpservers.org" /></a>
-  <a href="https://github.com/duhanguler/pgveil/releases"><img src="https://img.shields.io/badge/Release-v0.4.0-18181b?style=flat-square" alt="v0.4.0" /></a>
+  <a href="https://github.com/duhanguler/pgveil/releases"><img src="https://img.shields.io/badge/Release-v0.5.0-18181b?style=flat-square" alt="v0.5.0" /></a>
   <a href="https://github.com/duhanguler/homebrew-tap"><img src="https://img.shields.io/badge/Homebrew-duhanguler%2Ftap%2Fpgveil-18181b?style=flat-square&logo=homebrew&logoColor=white" alt="Homebrew Tap" /></a>
   <img src="https://img.shields.io/badge/Go-1.26%2B-00ADD8?style=flat-square&logo=go&logoColor=white" alt="Go 1.26+" />
   <img src="https://img.shields.io/badge/PostgreSQL-14--17%20Wire%20v3-336791?style=flat-square&logo=postgresql&logoColor=white" alt="PostgreSQL Wire v3" />
@@ -17,7 +17,7 @@
 
 # pgveil
 
-**Zero-trust PostgreSQL Wire Protocol v3 proxy, AST Virtual RLS rewriter & native MCP server in Go** — dynamic wire-speed PII masking (**8 compliance packs: GDPR, KVKK, PCI-DSS, HIPAA, LGPD, PIPEDA, UK-GDPR, Secrets**), real **PostgreSQL 17 AST SQL firewall**, **AST-level Virtual Row-Level Security (tenant predicate injection)**, **multi-hop CTE taint & PII side-channel oracle guard**, **automatic live schema PII discovery & `pgveil init` wizard**, **synchronous Human-in-the-Loop (HITL) wire holds**, **runaway AI-agent loop circuit breaker**, **shadow audit-only rollout mode**, async **Kafka audit streaming**, **OpenTelemetry/Prometheus observability**, an embedded **Precision Database Workbench (`68 KB` gzip, Dark + Light theme)**, and a production **Kubernetes Helm chart**.
+**Zero-trust PostgreSQL Wire Protocol v3 proxy, AST Virtual RLS rewriter & Streamable HTTP/stdio MCP server in Go** — dynamic wire-speed PII masking (**8 compliance packs: GDPR, KVKK, PCI-DSS, HIPAA, LGPD, PIPEDA, UK-GDPR, Secrets**), real **PostgreSQL 17 AST SQL firewall**, **typed `A_Const` JWT → Virtual Row-Level Security (`{{jwt.tenant_id}}`, fail-closed)**, **sideband read-only `EXPLAIN` Cost & Blast-Radius Guard (with LRU plan cache & GUC `statement_timeout` lock)**, **multi-hop CTE taint & PII side-channel oracle guard**, **automatic live schema PII discovery & `pgveil init` wizard**, **unfurler-safe Slack Block Kit & ChatOps HITL holds**, **runaway AI-agent loop circuit breaker**, **shadow audit-only rollout mode**, async **Kafka audit streaming**, **OpenTelemetry/Prometheus observability**, an embedded **Precision Database Workbench (`70 KB` gzip, Dark + Light theme)**, and a production **Kubernetes Helm chart**.
 
 Give **AI agents (Claude Code, Cursor, MCP, LangChain)**, BI tools (**Metabase, Superset, DBeaver**), and developers live access to PostgreSQL — **with zero database extensions, zero schema changes, and a 1-line port swap (`5432` → `6432`) or zero-Node.js native `pgveil mcp`**.
 
@@ -358,6 +358,7 @@ helm upgrade --install pgveil deploy/helm/pgveil \
 - [ADR-003: Wire-Level Dynamic Masking & Extended Query Protocol Binary Fidelity](docs/adr/ADR-003-extended-protocol-masking.md)
 - [ADR-004: Non-Blocking Kafka Audit Pipeline & Synchronous HITL Wire Holds](docs/adr/ADR-004-async-kafka-and-live-hitl.md)
 - [ADR-005: AST Side-Channel PII Inference Protection & Native MCP Server Mode](docs/adr/ADR-005-pii-inference-and-native-mcp.md)
+- [ADR-006: Streamable HTTP MCP + Typed AST `{{jwt.*}}` RLS, Unfurler-Safe ChatOps HITL & Sideband `EXPLAIN` Cost Guard](docs/adr/ADR-006-zero-trust-http-mcp-unfurl-safe-chatops-and-sideband-cost-guard.md)
 
 ---
 

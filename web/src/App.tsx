@@ -98,7 +98,7 @@ export default function App() {
   // Live backend state
   const [summary, setSummary] = useState<Summary | null>(null)
   const [proxyAddr, setProxyAddr] = useState(':6432')
-  const [version, setVersion] = useState('0.5.0')
+  const [version, setVersion] = useState('0.5.1')
   const [mcpHttpEnabled, setMcpHttpEnabled] = useState(false)
   const [chatopsConfigured, setChatopsConfigured] = useState(false)
   const [events, setEvents] = useState<AuditEvent[]>([])

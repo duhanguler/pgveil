@@ -1716,6 +1716,8 @@ func (s *Server) inferParamOIDs(sql string) []uint32 {
 			return
 		}
 		switch x := n.Node.(type) {
+		case *pg_query.Node_ExplainStmt:
+			walk(x.ExplainStmt.Query)
 		case *pg_query.Node_SelectStmt:
 			for _, fc := range x.SelectStmt.FromClause {
 				if c, err := s.inferFromCols(fc, nil); err == nil {

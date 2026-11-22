@@ -59,4 +59,27 @@ func TestBuildSimpleQuery(t *testing.T) {
 	if len(p) != 9 || p[8] != 0 || ParseSimpleQuery(p) != "SELECT 1" {
 		t.Fatalf("unexpected BuildSimpleQuery payload: %q", p)
 	}
+	if ParseSimpleQuery([]byte("SELECT 2")) != "SELECT 2" {
+		t.Fatalf("ParseSimpleQuery without trailing NUL failed")
+	}
+	if n := BuildNoticeResponse("NOTICE", "00000", "hello"); len(n) == 0 {
+		t.Fatal("BuildNoticeResponse returned empty")
+	}
+	if c := BuildCommandComplete("SELECT 1"); string(c) != "SELECT 1\x00" {
+		t.Fatalf("unexpected CommandComplete: %q", c)
+	}
+	for _, st := range []byte{'I', 'T', 'E'} {
+		if got := BuildReadyForQuery(st); len(got) != 1 || got[0] != st {
+			t.Fatalf("BuildReadyForQuery(%q) = %q", st, got)
+		}
+	}
+	if got := BuildReadyForQuery('X'); len(got) != 1 || got[0] != 'I' {
+		t.Fatalf("BuildReadyForQuery invalid fallback = %q", got)
+	}
+	if _, _, err := ParseParseMessage([]byte("no_nul")); err == nil {
+		t.Fatal("expected error on truncated Parse message")
+	}
+	if _, err := RewriteParseMessage([]byte("no_nul"), "SELECT 1"); err == nil {
+		t.Fatal("expected error on malformed RewriteParseMessage")
+	}
 }

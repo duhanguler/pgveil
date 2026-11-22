@@ -925,6 +925,11 @@ func evalConstInt(n *pg_query.Node, depth int) (int64, bool) {
 				return 0, false
 			}
 			return l / r, true
+		case "%":
+			if r == 0 {
+				return 0, false
+			}
+			return l % r, true
 		}
 	}
 	return 0, false

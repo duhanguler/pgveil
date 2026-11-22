@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"os"
@@ -79,28 +80,34 @@ Usage:
 }
 
 func runDemo(args []string) {
-	fs := flag.NewFlagSet("demo", flag.ExitOnError)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := runDemoCtx(ctx, args); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+}
+
+func runDemoCtx(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("demo", flag.ContinueOnError)
 	listenAddr := fs.String("listen", ":6432", "Wire proxy listen address")
 	adminAddr := fs.String("admin", ":8088", "Web Console & Control Plane HTTP address")
 	logLevel := fs.String("log-level", "warn", "Log level (debug, info, warn, error)")
-	_ = fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 
 	initLogger(*logLevel)
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	demoPG := demo.NewServer()
 	upstreamAddr, err := demoPG.Start(ctx, "127.0.0.1:0")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to start embedded demo PostgreSQL backend: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to start embedded demo PostgreSQL backend: %w", err)
 	}
 
 	policyMgr, err := policy.LoadBytes(demo.BuildDemoConfigYAML(*listenAddr, *adminAddr, upstreamAddr))
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to compile demo configuration: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to compile demo configuration: %w", err)
 	}
 	cfg := policyMgr.Config()
 
@@ -119,8 +126,7 @@ func runDemo(args []string) {
 
 	wireProxy, err := proxy.NewServer(policyMgr, hitlMgr, eventBus, metrics, tracer)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to initialize wire proxy: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to initialize wire proxy: %w", err)
 	}
 
 	distFS, _ := webui.DistFS()
@@ -176,10 +182,9 @@ Press Ctrl+C to stop.
 		shutCtx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		_ = httpSrv.Shutdown(shutCtx)
+		return nil
 	case err := <-errCh:
-		fmt.Fprintf(os.Stderr, "demo server error: %v\n", err)
-		stop()
-		os.Exit(1)
+		return fmt.Errorf("demo server error: %w", err)
 	}
 }
 
@@ -255,26 +260,34 @@ func formatDisplayHostPort(addr string) string {
 }
 
 func runServe(args []string) {
-	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := runServeCtx(ctx, args); err != nil {
+		slog.Error("fatal server error", "err", err)
+		os.Exit(1)
+	}
+}
+
+func runServeCtx(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	cfgPath := fs.String("config", "configs/pgveil.yaml", "Path to pgveil YAML configuration file")
 	logLevel := fs.String("log-level", "info", "Log level (debug, info, warn, error)")
-	_ = fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 
 	initLogger(*logLevel)
 
 	policyMgr, err := policy.LoadFile(*cfgPath)
 	if err != nil {
-		slog.Error("failed to load configuration", "path", *cfgPath, "err", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to load configuration %q: %w", *cfgPath, err)
 	}
 	cfg := policyMgr.Config()
-
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	// Live hot-reload on SIGHUP
 	sighup := make(chan os.Signal, 1)
 	signal.Notify(sighup, syscall.SIGHUP)
+	defer signal.Stop(sighup)
 	go func() {
 		for {
 			select {
@@ -306,8 +319,7 @@ func runServe(args []string) {
 
 	wireProxy, err := proxy.NewServer(policyMgr, hitlMgr, eventBus, metrics, tracer)
 	if err != nil {
-		slog.Error("failed to initialize wire proxy", "err", err)
-		os.Exit(1)
+		return fmt.Errorf("failed to initialize wire proxy: %w", err)
 	}
 
 	distFS, err := webui.DistFS()
@@ -344,10 +356,9 @@ func runServe(args []string) {
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = httpSrv.Shutdown(shutCtx)
+		return nil
 	case err := <-errCh:
-		slog.Error("fatal server error", "err", err)
-		stop()
-		os.Exit(1)
+		return err
 	}
 }
 
@@ -415,25 +426,33 @@ func runDiscover(args []string) {
 }
 
 func runMCP(args []string) {
-	fs := flag.NewFlagSet("mcp", flag.ExitOnError)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	if err := runMCPCtx(ctx, args, os.Stdin, os.Stdout); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+}
+
+func runMCPCtx(ctx context.Context, args []string, r io.Reader, w io.Writer) error {
+	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
 	cfgPath := fs.String("config", "configs/pgveil.yaml", "Path to pgveil YAML configuration file")
 	profileName := fs.String("profile", "ai_agent", "Role profile enforced on MCP tool calls")
 	dsn := fs.String("dsn", "", "Optional PostgreSQL DSN override")
-	_ = fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
 
 	mgr, err := policy.LoadFile(*cfgPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "config error: %v\n", err)
-		os.Exit(1)
+		return fmt.Errorf("config error: %w", err)
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
 
 	srv := mcpserver.NewServer(mgr, *profileName, *dsn, version)
-	if err := srv.ServeStdio(ctx, os.Stdin, os.Stdout); err != nil {
-		fmt.Fprintf(os.Stderr, "mcp stdio server error: %v\n", err)
-		os.Exit(1)
+	if err := srv.ServeStdio(ctx, r, w); err != nil {
+		return fmt.Errorf("mcp stdio server error: %w", err)
 	}
+	return nil
 }
 
 func runValidate(args []string) {
@@ -452,22 +471,31 @@ func runValidate(args []string) {
 }
 
 func runScan(args []string) {
-	fs := flag.NewFlagSet("scan", flag.ExitOnError)
+	code, err := executeScan(args, os.Stdout)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+	}
+	os.Exit(code)
+}
+
+func executeScan(args []string, w io.Writer) (int, error) {
+	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
 	cfgPath := fs.String("config", "configs/pgveil.yaml", "Path to pgveil YAML configuration file")
 	sqlQuery := fs.String("sql", "", "SQL query to inspect against the AST firewall")
 	profileName := fs.String("profile", "ai_agent", "Role profile name")
 	sampleText := fs.String("text", "", "Optional sample text to scan with PII compliance packs")
-	_ = fs.Parse(args)
+	if err := fs.Parse(args); err != nil {
+		return 1, err
+	}
 
 	mgr, err := policy.LoadFile(*cfgPath)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "config error: %v\n", err)
-		os.Exit(1)
+		return 1, fmt.Errorf("config error: %w", err)
 	}
 	prof, ok := mgr.GetProfileByName(*profileName)
 	if !ok {
-		fmt.Fprintf(os.Stderr, "profile %q not found\n", *profileName)
-		os.Exit(1)
+		return 1, fmt.Errorf("profile %q not found", *profileName)
 	}
 
 	out := map[string]any{"profile": prof.Name}
@@ -496,10 +524,10 @@ func runScan(args []string) {
 		out["masked_text"] = masked
 		out["pii_entities"] = counts
 	}
-	enc := json.NewEncoder(os.Stdout)
+	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(out)
-	os.Exit(exitCode)
+	return exitCode, nil
 }
 
 func initLogger(level string) {

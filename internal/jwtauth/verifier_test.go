@@ -328,4 +328,35 @@ profiles:
 			t.Fatalf("expected error on malformed token %q", malformed)
 		}
 	}
+
+	// Bug #4b Regression: Mixed-case JWT role claim and API key profile MUST normalize to canonical
+	// profile name so rate-limit buckets and Prometheus labels cannot suffer cardinality splits.
+	mixedRoleTok := signRS256(t, rsaPriv, "rsa-1", map[string]any{"sub": "case-attacker", "exp": now + 300, "role": "aI_aGeNt"})
+	idMixed, err := vRSA.AuthenticateHeader(ctx, "BEARER "+mixedRoleTok, "ai_agent")
+	if err != nil {
+		t.Fatalf("mixed-case BEARER + role claim failed: %v", err)
+	}
+	if idMixed.Profile != "ai_agent" {
+		t.Fatalf("expected canonical profile 'ai_agent', got %q", idMixed.Profile)
+	}
+
+	akMgr, err := policy.LoadBytes([]byte(`
+mcp:
+  auth:
+    enabled: true
+    api_keys:
+      - name: fallback-key
+        token: secret_tok_123
+profiles:
+  - name: ai_agent
+    masking:
+      enabled: true
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	idAK, err := NewVerifier(akMgr).VerifyToken(ctx, "secret_tok_123", "AI_Agent")
+	if err != nil || idAK.Profile != "ai_agent" {
+		t.Fatalf("expected canonical API key fallback profile 'ai_agent', got %+v err=%v", idAK, err)
+	}
 }

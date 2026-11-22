@@ -611,14 +611,40 @@ func (s *Server) toolQuery(ctx context.Context, prof *policy.RoleProfile, caller
 	}
 
 	qTimeout := prof.Firewall.MaxQueryDurationParsed()
-	if qTimeout <= 0 {
-		qTimeout = 15 * time.Second
+	ctxTimeout := qTimeout
+	if ctxTimeout <= 0 {
+		ctxTimeout = 15 * time.Second
 	}
-	qCtx, cancel := context.WithTimeout(ctx, qTimeout)
+	qCtx, cancel := context.WithTimeout(ctx, ctxTimeout)
 	defer cancel()
 
+	// Acquire a dedicated pooled connection so server-side PostgreSQL statement_timeout is enforced
+	// atomically per profile and cleanly reset to 0 before returning the connection to the pool.
+	conn, err := pool.Acquire(qCtx)
+	if err != nil {
+		return "database connection error: " + err.Error(), true
+	}
+	appliedTimeout := false
+	if qTimeout > 0 {
+		ms := qTimeout.Milliseconds()
+		if ms < 1 {
+			ms = 1
+		}
+		if _, terr := conn.Exec(qCtx, fmt.Sprintf("SET statement_timeout = '%dms'", ms)); terr == nil {
+			appliedTimeout = true
+		}
+	}
+	defer func() {
+		if appliedTimeout {
+			rctx, rcancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+			_, _ = conn.Exec(rctx, "SET statement_timeout = 0")
+			rcancel()
+		}
+		conn.Release()
+	}()
+
 	upStart := time.Now()
-	rows, err := pool.Query(qCtx, execSQL)
+	rows, err := conn.Query(qCtx, execSQL)
 	if err != nil {
 		return "PostgreSQL error: " + err.Error(), true
 	}
@@ -701,6 +727,11 @@ func (s *Server) toolQuery(ctx context.Context, prof *policy.RoleProfile, caller
 	if err := rows.Err(); err != nil {
 		return "PostgreSQL error: " + err.Error(), true
 	}
+	rows.Close()
+	cmdTag := rows.CommandTag().String()
+	if cmdTag == "" {
+		cmdTag = fmt.Sprintf("SELECT %d", len(result))
+	}
 	upDur := time.Since(upStart)
 
 	finalDecision := "ALLOW"
@@ -715,6 +746,8 @@ func (s *Server) toolQuery(ctx context.Context, prof *policy.RoleProfile, caller
 
 	outMap := map[string]any{
 		"profile":          prof.Name,
+		"columns":          cols,
+		"command_tag":      cmdTag,
 		"row_count":        len(result),
 		"truncated":        truncated,
 		"pii_cells_masked": maskedCells,

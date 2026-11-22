@@ -793,7 +793,12 @@ func compilePredicateAST(rawPred string, sess SessionContext) (*pg_query.Node, s
 	}
 
 	if len(bindings) > 0 {
-		injectSentinelASTValues(sel.WhereClause, bindings, 0)
+		pairs := make([]string, 0, len(bindings)*2)
+		for _, b := range bindings {
+			pairs = append(pairs, b.token, b.value)
+		}
+		replacer := strings.NewReplacer(pairs...)
+		injectSentinelASTValues(sel.WhereClause, replacer, 0)
 	}
 
 	displayPred := rawPred
@@ -834,7 +839,7 @@ func resolvePlaceholderValue(key string, sess SessionContext) (string, error) {
 	}
 }
 
-func injectSentinelASTValues(n *pg_query.Node, bindings []sentinelBinding, depth int) {
+func injectSentinelASTValues(n *pg_query.Node, replacer *strings.Replacer, depth int) {
 	if n == nil || depth > 64 {
 		return
 	}
@@ -842,58 +847,54 @@ func injectSentinelASTValues(n *pg_query.Node, bindings []sentinelBinding, depth
 	switch x := n.Node.(type) {
 	case *pg_query.Node_AConst:
 		if sv := x.AConst.GetSval(); sv != nil {
-			for _, b := range bindings {
-				if strings.Contains(sv.Sval, b.token) {
-					sv.Sval = strings.ReplaceAll(sv.Sval, b.token, b.value)
-				}
-			}
+			sv.Sval = replacer.Replace(sv.Sval)
 		}
 	case *pg_query.Node_BoolExpr:
 		for _, a := range x.BoolExpr.Args {
-			injectSentinelASTValues(a, bindings, d)
+			injectSentinelASTValues(a, replacer, d)
 		}
 	case *pg_query.Node_AExpr:
-		injectSentinelASTValues(x.AExpr.Lexpr, bindings, d)
-		injectSentinelASTValues(x.AExpr.Rexpr, bindings, d)
+		injectSentinelASTValues(x.AExpr.Lexpr, replacer, d)
+		injectSentinelASTValues(x.AExpr.Rexpr, replacer, d)
 	case *pg_query.Node_FuncCall:
 		for _, a := range x.FuncCall.Args {
-			injectSentinelASTValues(a, bindings, d)
+			injectSentinelASTValues(a, replacer, d)
 		}
-		injectSentinelASTValues(x.FuncCall.AggFilter, bindings, d)
+		injectSentinelASTValues(x.FuncCall.AggFilter, replacer, d)
 	case *pg_query.Node_TypeCast:
-		injectSentinelASTValues(x.TypeCast.Arg, bindings, d)
+		injectSentinelASTValues(x.TypeCast.Arg, replacer, d)
 	case *pg_query.Node_NullTest:
-		injectSentinelASTValues(x.NullTest.Arg, bindings, d)
+		injectSentinelASTValues(x.NullTest.Arg, replacer, d)
 	case *pg_query.Node_BooleanTest:
-		injectSentinelASTValues(x.BooleanTest.Arg, bindings, d)
+		injectSentinelASTValues(x.BooleanTest.Arg, replacer, d)
 	case *pg_query.Node_CoalesceExpr:
 		for _, a := range x.CoalesceExpr.Args {
-			injectSentinelASTValues(a, bindings, d)
+			injectSentinelASTValues(a, replacer, d)
 		}
 	case *pg_query.Node_MinMaxExpr:
 		for _, a := range x.MinMaxExpr.Args {
-			injectSentinelASTValues(a, bindings, d)
+			injectSentinelASTValues(a, replacer, d)
 		}
 	case *pg_query.Node_CaseExpr:
-		injectSentinelASTValues(x.CaseExpr.Arg, bindings, d)
+		injectSentinelASTValues(x.CaseExpr.Arg, replacer, d)
 		for _, w := range x.CaseExpr.Args {
-			injectSentinelASTValues(w, bindings, d)
+			injectSentinelASTValues(w, replacer, d)
 		}
-		injectSentinelASTValues(x.CaseExpr.Defresult, bindings, d)
+		injectSentinelASTValues(x.CaseExpr.Defresult, replacer, d)
 	case *pg_query.Node_CaseWhen:
-		injectSentinelASTValues(x.CaseWhen.Expr, bindings, d)
-		injectSentinelASTValues(x.CaseWhen.Result, bindings, d)
+		injectSentinelASTValues(x.CaseWhen.Expr, replacer, d)
+		injectSentinelASTValues(x.CaseWhen.Result, replacer, d)
 	case *pg_query.Node_List:
 		for _, it := range x.List.Items {
-			injectSentinelASTValues(it, bindings, d)
+			injectSentinelASTValues(it, replacer, d)
 		}
 	case *pg_query.Node_AArrayExpr:
 		for _, el := range x.AArrayExpr.Elements {
-			injectSentinelASTValues(el, bindings, d)
+			injectSentinelASTValues(el, replacer, d)
 		}
 	case *pg_query.Node_RowExpr:
 		for _, el := range x.RowExpr.Args {
-			injectSentinelASTValues(el, bindings, d)
+			injectSentinelASTValues(el, replacer, d)
 		}
 	}
 }
@@ -937,6 +938,10 @@ func qualifyColumns(n *pg_query.Node, qualifier []string, depth int) {
 		for _, a := range x.CoalesceExpr.Args {
 			qualifyColumns(a, qualifier, d)
 		}
+	case *pg_query.Node_MinMaxExpr:
+		for _, a := range x.MinMaxExpr.Args {
+			qualifyColumns(a, qualifier, d)
+		}
 	case *pg_query.Node_CaseExpr:
 		qualifyColumns(x.CaseExpr.Arg, qualifier, d)
 		for _, w := range x.CaseExpr.Args {
@@ -952,6 +957,10 @@ func qualifyColumns(n *pg_query.Node, qualifier []string, depth int) {
 		}
 	case *pg_query.Node_AArrayExpr:
 		for _, el := range x.AArrayExpr.Elements {
+			qualifyColumns(el, qualifier, d)
+		}
+	case *pg_query.Node_RowExpr:
+		for _, el := range x.RowExpr.Args {
 			qualifyColumns(el, qualifier, d)
 		}
 	}

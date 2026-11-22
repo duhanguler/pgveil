@@ -502,11 +502,13 @@ func (s *Server) handleExtendedBatch(
 	spanCtx, span := s.startSpan(ctx, "pgveil.extended_query", meta, profile)
 	defer span.End()
 
-	// Inspect EVERY Parse and Bind statement in this pipeline batch so a blocked or HITL
-	// statement can NEVER hide behind a subsequent benign `SELECT 1` in the same pipeline!
+	// Inspect EVERY Parse and Bind statement in this pipeline batch so a blocked, HITL, or
+	// high-cost statement can NEVER hide behind a subsequent benign `SELECT 1` in the same pipeline!
 	type inspectedStmt struct {
-		sql string
-		dec firewall.Decision
+		batchIdx int // index in batch for MsgParse, or -1 for cached MsgBind
+		stmtName string
+		sql      string
+		dec      firewall.Decision
 	}
 	var inspected []inspectedStmt
 	var pendingStmts []struct {
@@ -537,7 +539,7 @@ func (s *Server) handleExtendedBatch(
 			t0 := time.Now()
 			dec := firewall.Evaluate(query, profile)
 			proxyOverhead += time.Since(t0)
-			inspected = append(inspected, inspectedStmt{sql: query, dec: dec})
+			inspected = append(inspected, inspectedStmt{batchIdx: i, stmtName: stmtName, sql: query, dec: dec})
 		case pgwire.MsgDescribe:
 			if len(m.payload) >= 2 && m.payload[0] == 'S' {
 				activeStmtName = pgwire.ParseSimpleQuery(m.payload[1:])
@@ -555,7 +557,7 @@ func (s *Server) handleExtendedBatch(
 						t0 := time.Now()
 						dec := firewall.Evaluate(cachedSQL, profile)
 						proxyOverhead += time.Since(t0)
-						inspected = append(inspected, inspectedStmt{sql: cachedSQL, dec: dec})
+						inspected = append(inspected, inspectedStmt{batchIdx: -1, stmtName: stmtName, sql: cachedSQL, dec: dec})
 					}
 				}
 			}
@@ -627,6 +629,7 @@ func (s *Server) handleExtendedBatch(
 	// original-SQL firewall evaluation and HITL approval have passed.
 	var batchRLS firewall.RLSResult
 	pendingRLS := make(map[string]firewall.RLSResult)
+	rlsByBatchIdx := make(map[int]firewall.RLSResult)
 	if !profile.IsAuditOnly() && len(profile.Firewall.RowFilters) > 0 {
 		sessCtx := meta.rlsSession(profile.Name)
 		for i := range batch {
@@ -658,12 +661,53 @@ func (s *Server) handleExtendedBatch(
 				}
 				batch[i].payload = rewrittenPayload
 				pendingRLS[stmtName] = rlsRes
+				rlsByBatchIdx[i] = rlsRes
 				batchRLS = rlsRes
 			}
 		}
 	}
 
-	// Only cache parsed statements in session metadata AFTER every statement in the batch passed policy!
+	// Evaluate Sideband Read-Only EXPLAIN Cost Guard on EVERY pipelined statement (using each
+	// statement's own RLS-rewritten SQL) BEFORE caching prepared statements or forwarding upstream.
+	var batchPlanMetrics *firewall.PlanMetrics
+	if hasQuery {
+		for _, item := range inspected {
+			var itemRLS firewall.RLSResult
+			if item.batchIdx >= 0 {
+				itemRLS = rlsByBatchIdx[item.batchIdx]
+			} else if cached, ok := meta.stmtRLS[item.stmtName]; ok {
+				itemRLS = cached
+			}
+			effectiveSQL := item.sql
+			if itemRLS.Rewritten {
+				effectiveSQL = itemRLS.SQL
+			}
+			costStart := time.Now()
+			costVerdict := s.evaluateCostGuard(spanCtx, profile, effectiveSQL, item.dec.Fingerprint, itemRLS.RulesApplied)
+			if costVerdict.Evaluated {
+				proxyOverhead += time.Since(costStart)
+			}
+			if costVerdict.Metrics != nil {
+				batchPlanMetrics = costVerdict.Metrics
+			}
+			if costVerdict.Blocked {
+				dec := item.dec
+				dec.Rule = costVerdict.Rule
+				dec.Reason = costVerdict.Reason
+				dec.RiskLevel = "HIGH"
+				if profile.IsAuditOnly() {
+					hitlOutcome = "WOULD_BLOCK"
+					primarySQL = item.sql
+					primaryDec = dec
+				} else {
+					s.recordAndEmitBlockedWithCost(span, meta, profile, item.sql, dec, costVerdict.Metrics, "BLOCKED", proxyOverhead)
+					return s.sendBlockedErrorCode(clientW, meta.txStatus, "54000", costVerdict.Reason, fmt.Sprintf("rule=%s profile=%s", costVerdict.Rule, profile.Name), "Add selective WHERE filters, indexes, or smaller LIMIT")
+				}
+			}
+		}
+	}
+
+	// Only cache parsed statements in session metadata AFTER every statement in the batch passed policy & Cost Guard!
 	for _, ps := range pendingStmts {
 		meta.prepStmts[ps.name] = ps.query
 		delete(meta.stmtFields, ps.name)
@@ -676,31 +720,6 @@ func (s *Server) handleExtendedBatch(
 	if !batchRLS.Rewritten && activeStmtName != "" {
 		if cached, ok := meta.stmtRLS[activeStmtName]; ok {
 			batchRLS = cached
-		}
-	}
-
-	var batchPlanMetrics *firewall.PlanMetrics
-	if hasQuery {
-		effectiveSQL := primarySQL
-		if batchRLS.Rewritten {
-			effectiveSQL = batchRLS.SQL
-		}
-		costStart := time.Now()
-		costVerdict := s.evaluateCostGuard(spanCtx, profile, effectiveSQL, primaryDec.Fingerprint, batchRLS.RulesApplied)
-		if costVerdict.Evaluated {
-			proxyOverhead += time.Since(costStart)
-		}
-		batchPlanMetrics = costVerdict.Metrics
-		if costVerdict.Blocked {
-			primaryDec.Rule = costVerdict.Rule
-			primaryDec.Reason = costVerdict.Reason
-			primaryDec.RiskLevel = "HIGH"
-			if profile.IsAuditOnly() {
-				hitlOutcome = "WOULD_BLOCK"
-			} else {
-				s.recordAndEmitBlockedWithCost(span, meta, profile, primarySQL, primaryDec, costVerdict.Metrics, "BLOCKED", proxyOverhead)
-				return s.sendBlockedErrorCode(clientW, meta.txStatus, "54000", costVerdict.Reason, fmt.Sprintf("rule=%s profile=%s", costVerdict.Rule, profile.Name), "Add selective WHERE filters, indexes, or smaller LIMIT")
-			}
 		}
 	}
 

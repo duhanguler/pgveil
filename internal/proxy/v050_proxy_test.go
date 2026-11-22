@@ -107,4 +107,23 @@ func TestWireProxyStartupTimeoutCostGuardAndTxSafety(t *testing.T) {
 	if !foundCostAudit {
 		t.Fatalf("expected BLOCKED AuditEvent with EstimatedCost > 50000, got %+v", evs)
 	}
+
+	// 4. Regression (Bug #1): Extended Query Pipeline batch hiding an expensive Cartesian join
+	// behind a trailing benign `SELECT 1` MUST be blocked with SQLSTATE 54000!
+	batch := &pgx.Batch{}
+	batch.Queue("SELECT c.id FROM customers c, orders o, payments p")
+	batch.Queue("SELECT 1")
+	br := conn.SendBatch(ctx, batch)
+	_, bErr1 := br.Exec()
+	_ = br.Close()
+	var batchPGErr *pgconn.PgError
+	if !errors.As(bErr1, &batchPGErr) || batchPGErr.Code != "54000" {
+		t.Fatalf("expected Extended Pipeline Cost Guard bypass attempt to fail with SQLSTATE 54000, got %v", bErr1)
+	}
+
+	// Verify session remains clean & usable after blocked pipeline batch
+	var afterID int
+	if err := conn.QueryRow(ctx, "SELECT id FROM customers WHERE id = $1", 1).Scan(&afterID); err != nil || afterID != 1 {
+		t.Fatalf("session unhealthy after blocked pipeline batch: id=%d err=%v", afterID, err)
+	}
 }

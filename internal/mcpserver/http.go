@@ -19,6 +19,7 @@ import (
 
 const (
 	maxMCPHTTPBodyBytes = 1024 * 1024 // 1 MiB JSON-RPC payload cap
+	maxMCPBatchSize     = 20          // Cap JSON-RPC batch size to prevent amplification DoS
 	maxMCPSessions      = 4096
 	mcpSessionTTL       = 30 * time.Minute
 	headerMCPSessionID  = "Mcp-Session-Id"
@@ -137,6 +138,11 @@ func (s *Server) HTTPHandler() http.Handler {
 				})
 				return
 			}
+			if len(reqs) > maxMCPBatchSize {
+				s.recordHTTPMetric("batch", ident.Profile, "400")
+				writeHTTPError(w, http.StatusBadRequest, fmt.Sprintf("JSON-RPC batch size %d exceeds maximum allowed (%d)", len(reqs), maxMCPBatchSize))
+				return
+			}
 		} else {
 			var single RPCRequest
 			if err := json.Unmarshal(trimmed, &single); err != nil {
@@ -158,6 +164,11 @@ func (s *Server) HTTPHandler() http.Handler {
 				hasInitialize = true
 				break
 			}
+		}
+		if hasInitialize && len(reqs) > 1 {
+			s.recordHTTPMetric("initialize", ident.Profile, "400")
+			writeHTTPError(w, http.StatusBadRequest, "initialize must be sent as a standalone JSON-RPC request, not inside a multi-request batch")
+			return
 		}
 		if incomingSID != "" && !hasInitialize {
 			if code, msg := s.validateSession(incomingSID, ident.Subject); code != 0 {
@@ -236,10 +247,10 @@ func (s *Server) isOriginAllowed(origin string) bool {
 	// Default DNS-rebinding defense: permit loopback browser origins (e.g. embedded local Workbench),
 	// reject arbitrary third-party web origins unless explicitly listed in mcp.allowed_origins.
 	u, err := url.Parse(origin)
-	if err != nil || u.Host == "" {
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
 		return false
 	}
-	host := u.Hostname()
+	host := strings.ToLower(u.Hostname())
 	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
 		return true
 	}
@@ -317,12 +328,22 @@ func (s *Server) deleteSession(sid, subject string) bool {
 	return true
 }
 
+func normalizeMCPMetricMethod(method string) string {
+	switch method {
+	case "initialize", "notifications/initialized", "ping", "tools/list", "tools/call",
+		"GET", "POST", "DELETE", "origin_check", "auth", "batch", "parse_error":
+		return method
+	default:
+		return "other"
+	}
+}
+
 func (s *Server) recordHTTPMetric(method, profile, status string) {
 	if s.metrics != nil && s.metrics.MCPHTTPRequests != nil {
 		if profile == "" {
 			profile = "unknown"
 		}
-		s.metrics.MCPHTTPRequests.WithLabelValues(method, profile, status).Inc()
+		s.metrics.MCPHTTPRequests.WithLabelValues(normalizeMCPMetricMethod(method), profile, status).Inc()
 	}
 }
 

@@ -113,23 +113,42 @@ func (r *CostRunner) Close() {
 }
 
 // Check evaluates sql (post-Virtual-RLS rewrite) against profile.Firewall.CostGuard.
-func (r *CostRunner) Check(ctx context.Context, sql string, fingerprint string, rlsRules []string, profile *policy.RoleProfile) CostVerdict {
+// Multi-statement Simple Queries are split via PG17 AST and every explainable statement is checked
+// independently so an expensive statement can never hide behind a trailing "; SELECT 1".
+func (r *CostRunner) Check(ctx context.Context, sql string, _ string, rlsRules []string, profile *policy.RoleProfile) CostVerdict {
 	if r == nil || profile == nil || !profile.Firewall.CostGuard.Enabled {
 		return CostVerdict{}
 	}
-	cg := profile.Firewall.CostGuard
-	explainable, hasParams := ClassifyForCostGuard(sql)
-	if !explainable {
+	targets := ExtractExplainTargets(sql)
+	if len(targets) == 0 {
 		return CostVerdict{}
 	}
 
+	var lastVerdict CostVerdict
+	for _, target := range targets {
+		v := r.checkSingle(ctx, target, rlsRules, profile)
+		if v.Evaluated {
+			lastVerdict = v
+		}
+		if v.Blocked {
+			return v
+		}
+	}
+	return lastVerdict
+}
+
+func (r *CostRunner) checkSingle(ctx context.Context, target ExplainTarget, rlsRules []string, profile *policy.RoleProfile) CostVerdict {
+	cg := profile.Firewall.CostGuard
 	policyVer := int64(1)
 	if r.policyMgr != nil {
 		policyVer = r.policyMgr.Version()
 	}
+	// Key PlanCache on canonicalized SQL text (preserving literals like LIMIT 5 vs LIMIT 99999999)
+	// rather than constant-blind pg_query.Fingerprint so small-LIMIT queries cannot poison the cache.
+	sqlKey := CanonicalSQLKey(target.SQL)
 	cacheKey := ""
-	if fingerprint != "" && fingerprint != "unparseable" {
-		cacheKey = BuildPlanCacheKey(profile.Name, policyVer, fingerprint, rlsRules)
+	if sqlKey != "" {
+		cacheKey = BuildPlanCacheKey(profile.Name, policyVer, sqlKey, rlsRules)
 		if cached, ok := r.cache.Get(cacheKey); ok {
 			blocked, rule, reason := EvaluateCostGuard(&cached, cg)
 			return CostVerdict{
@@ -151,9 +170,9 @@ func (r *CostRunner) Check(ctx context.Context, sql string, fingerprint string, 
 		return r.handleExplainError("connect sideband EXPLAIN pool", err, cg)
 	}
 
-	explainSQL := "EXPLAIN (FORMAT JSON) " + sql
-	if hasParams {
-		explainSQL = "EXPLAIN (FORMAT JSON, GENERIC_PLAN) " + sql
+	explainSQL := "EXPLAIN (FORMAT JSON) " + target.SQL
+	if target.HasParams {
+		explainSQL = "EXPLAIN (FORMAT JSON, GENERIC_PLAN) " + target.SQL
 	}
 
 	rows, err := pool.Query(ectx, explainSQL)

@@ -364,7 +364,7 @@ func (s *Server) handleSimpleQuery(bw io.Writer, sql string) {
 		if raw == nil || raw.Stmt == nil {
 			continue
 		}
-		res, qerr := s.executeStmt(raw.Stmt, nil)
+		res, qerr := s.executeStmt(tree.Version, raw.Stmt, nil)
 		if qerr != nil {
 			_ = pgwire.WriteMessage(bw, pgwire.MsgErrorResponse,
 				pgwire.BuildErrorResponse("ERROR", "42000", qerr.Error(), "", ""))
@@ -433,10 +433,10 @@ func (s *Server) executeSQL(sql string, params []*string) (*queryResult, error) 
 	if len(tree.Stmts) == 0 || tree.Stmts[0].Stmt == nil {
 		return &queryResult{commandTag: "OK"}, nil
 	}
-	return s.executeStmt(tree.Stmts[0].Stmt, params)
+	return s.executeStmt(tree.Version, tree.Stmts[0].Stmt, params)
 }
 
-func (s *Server) executeStmt(stmt *pg_query.Node, params []*string) (*queryResult, error) {
+func (s *Server) executeStmt(pgVersion int32, stmt *pg_query.Node, params []*string) (*queryResult, error) {
 	switch x := stmt.Node.(type) {
 	case *pg_query.Node_SelectStmt:
 		s.mu.RLock()
@@ -454,7 +454,7 @@ func (s *Server) executeStmt(stmt *pg_query.Node, params []*string) (*queryResul
 		return s.execDelete(x.DeleteStmt, params)
 
 	case *pg_query.Node_ExplainStmt:
-		return s.execExplain(x.ExplainStmt), nil
+		return s.execExplain(pgVersion, x.ExplainStmt), nil
 
 	case *pg_query.Node_VariableShowStmt:
 		name := strings.ToLower(x.VariableShowStmt.Name)
@@ -1848,7 +1848,7 @@ func dedupeRows(rows [][]*string) [][]*string {
 	return out
 }
 
-func (s *Server) execExplain(exp *pg_query.ExplainStmt) *queryResult {
+func (s *Server) execExplain(pgVersion int32, exp *pg_query.ExplainStmt) *queryResult {
 	isJSON := false
 	for _, opt := range exp.Options {
 		de := opt.GetDefElem()
@@ -1862,7 +1862,8 @@ func (s *Server) execExplain(exp *pg_query.ExplainStmt) *queryResult {
 	planSQL := ""
 	if exp.Query != nil {
 		if dep, err := pg_query.Deparse(&pg_query.ParseResult{
-			Stmts: []*pg_query.RawStmt{{Stmt: exp.Query}},
+			Version: pgVersion,
+			Stmts:   []*pg_query.RawStmt{{Stmt: exp.Query}},
 		}); err == nil {
 			planSQL = dep
 		}
@@ -1894,7 +1895,11 @@ func (s *Server) execExplain(exp *pg_query.ExplainStmt) *queryResult {
 			hasSelectiveFilter = true
 		}
 		if sel.LimitCount != nil {
-			hasSmallLimit = true
+			if ac := sel.LimitCount.GetAConst(); ac != nil {
+				if iv := ac.GetIval(); iv != nil && iv.Ival > 0 && iv.Ival <= 100 {
+					hasSmallLimit = true
+				}
+			}
 		}
 		tableCount, relName = countSelectRelations(sel)
 	} else if upd := exp.Query.GetUpdateStmt(); upd != nil {

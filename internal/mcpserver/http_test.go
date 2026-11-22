@@ -258,4 +258,65 @@ func TestStreamableHTTPMCPJWTClaimsSessionBindingAndLiveHITL(t *testing.T) {
 			t.Fatalf("expected 400 on body %q, got %d", badBody, bresp.StatusCode)
 		}
 	}
+
+	// 12. Regression (Bug #4a): Reject mixed initialize batches (prevents Mcp-Session-Id validation bypass)
+	// and reject oversized batches (> maxMCPBatchSize = 20) to prevent amplification DoS.
+	mixedInitBatch := `[{"jsonrpc":"2.0","id":1,"method":"initialize"},{"jsonrpc":"2.0","id":2,"method":"tools/list"}]`
+	mixReq, _ := http.NewRequest(http.MethodPost, ts.URL, strings.NewReader(mixedInitBatch))
+	mixReq.Header.Set("Authorization", "Bearer "+ankaraJWT)
+	mixReq.Header.Set("Mcp-Session-Id", "mcps_stolen_foreign_session")
+	mixResp, _ := http.DefaultClient.Do(mixReq)
+	_ = mixResp.Body.Close()
+	if mixResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 on mixed initialize batch, got %d", mixResp.StatusCode)
+	}
+
+	bigBatchItems := make([]string, 25)
+	for i := range bigBatchItems {
+		bigBatchItems[i] = `{"jsonrpc":"2.0","id":1,"method":"ping"}`
+	}
+	bigReq, _ := http.NewRequest(http.MethodPost, ts.URL, strings.NewReader("["+strings.Join(bigBatchItems, ",")+"]"))
+	bigReq.Header.Set("Authorization", "Bearer "+ankaraJWT)
+	bigResp, _ := http.DefaultClient.Do(bigReq)
+	_ = bigResp.Body.Close()
+	if bigResp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("expected 400 on 25-item JSON-RPC batch (>20 cap), got %d", bigResp.StatusCode)
+	}
+
+	// Verify metric method label normalizes unknown attacker methods to "other"
+	if got := normalizeMCPMetricMethod("attacker_random_cardinality_999"); got != "other" {
+		t.Fatalf("expected unknown method normalized to 'other', got %q", got)
+	}
+
+	// 13. Regression (Bug #7 & #9): Deterministic columns + command_tag + pooled statement_timeout reset
+	colPayload := `{"jsonrpc":"2.0","id":77,"method":"tools/call","params":{"name":"query","arguments":{"sql":"SELECT email, id, city FROM customers"}}}`
+	for attempt := 0; attempt < 3; attempt++ {
+		cReq, _ := http.NewRequest(http.MethodPost, ts.URL, strings.NewReader(colPayload))
+		cReq.Header.Set("Authorization", "Bearer "+ankaraJWT)
+		cResp, err := http.DefaultClient.Do(cReq)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cBody, _ := io.ReadAll(cResp.Body)
+		_ = cResp.Body.Close()
+		var env struct {
+			Result struct {
+				Content []struct {
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"result"`
+		}
+		_ = json.Unmarshal(cBody, &env)
+		if len(env.Result.Content) == 0 {
+			t.Fatalf("missing tool content: %s", string(cBody))
+		}
+		var out struct {
+			Columns    []string `json:"columns"`
+			CommandTag string   `json:"command_tag"`
+		}
+		_ = json.Unmarshal([]byte(env.Result.Content[0].Text), &out)
+		if strings.Join(out.Columns, ",") != "email,id,city" || !strings.HasPrefix(out.CommandTag, "SELECT ") {
+			t.Fatalf("attempt %d: expected deterministic columns [email,id,city] and SELECT tag, got cols=%v tag=%q", attempt, out.Columns, out.CommandTag)
+		}
+	}
 }

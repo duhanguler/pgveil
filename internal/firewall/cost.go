@@ -85,7 +85,67 @@ func InspectExplainPlanOnly(sql string) (string, error) {
 	return candidate, nil
 }
 
-// ClassifyForCostGuard determines via PG17 AST whether sql is an explainable data statement
+// ExplainTarget represents an individual explainable SQL statement extracted for Cost Guard evaluation.
+type ExplainTarget struct {
+	SQL       string
+	HasParams bool
+}
+
+// ExtractExplainTargets parses sql using PG17's C AST parser and extracts every explainable data
+// statement (SELECT / UPDATE / DELETE / MERGE), including multi-statement Simple Queries so an
+// expensive query can never bypass Cost Guard by appending "; SELECT 1".
+func ExtractExplainTargets(sql string) []ExplainTarget {
+	trimmed := strings.TrimSpace(sql)
+	if trimmed == "" || trimmed == ";" || strings.IndexByte(trimmed, 0) >= 0 {
+		return nil
+	}
+	tree, err := pg_query.Parse(trimmed)
+	if err != nil || len(tree.Stmts) == 0 {
+		return nil
+	}
+	if len(tree.Stmts) == 1 {
+		root := tree.Stmts[0].Stmt
+		if root == nil || !isExplainableNode(root) {
+			return nil
+		}
+		return []ExplainTarget{{
+			SQL:       trimmed,
+			HasParams: containsParamRef(root, 0),
+		}}
+	}
+	targets := make([]ExplainTarget, 0, len(tree.Stmts))
+	for _, raw := range tree.Stmts {
+		if raw == nil || raw.Stmt == nil || !isExplainableNode(raw.Stmt) {
+			continue
+		}
+		dep, derr := pg_query.Deparse(&pg_query.ParseResult{
+			Version: tree.Version,
+			Stmts:   []*pg_query.RawStmt{{Stmt: raw.Stmt}},
+		})
+		if derr != nil || strings.TrimSpace(dep) == "" {
+			continue
+		}
+		targets = append(targets, ExplainTarget{
+			SQL:       dep,
+			HasParams: containsParamRef(raw.Stmt, 0),
+		})
+	}
+	return targets
+}
+
+func isExplainableNode(root *pg_query.Node) bool {
+	switch root.Node.(type) {
+	case *pg_query.Node_SelectStmt,
+		*pg_query.Node_UpdateStmt,
+		*pg_query.Node_DeleteStmt,
+		*pg_query.Node_MergeStmt:
+		return true
+	default:
+		return false
+	}
+}
+
+// ClassifyForCostGuard determines via PG17 AST whether sql is a single explainable data statement
 // (SELECT / UPDATE / DELETE / MERGE) and whether it contains positional parameter refs ($1, $2).
 func ClassifyForCostGuard(sql string) (explainable bool, hasParams bool) {
 	trimmed := strings.TrimSpace(sql)
@@ -97,17 +157,10 @@ func ClassifyForCostGuard(sql string) (explainable bool, hasParams bool) {
 		return false, false
 	}
 	root := tree.Stmts[0].Stmt
-	switch root.Node.(type) {
-	case *pg_query.Node_SelectStmt,
-		*pg_query.Node_UpdateStmt,
-		*pg_query.Node_DeleteStmt,
-		*pg_query.Node_MergeStmt:
-		explainable = true
-	default:
+	if !isExplainableNode(root) {
 		return false, false
 	}
-	hasParams = containsParamRef(root, 0)
-	return true, hasParams
+	return true, containsParamRef(root, 0)
 }
 
 func containsParamRef(n *pg_query.Node, depth int) bool {
@@ -375,13 +428,76 @@ func NewPlanCache(maxEntries int, ttl time.Duration) *PlanCache {
 	}
 }
 
-func BuildPlanCacheKey(profileName string, policyVer int64, fingerprint string, rlsRules []string) string {
+// CanonicalSQLKey collapses runs of unquoted whitespace while preserving quoted string/identifier
+// literals and numeric constants verbatim (e.g. LIMIT 5 vs LIMIT 99999999 remain distinct cache keys).
+func CanonicalSQLKey(sql string) string {
+	trimmed := strings.TrimSpace(sql)
+	if trimmed == "" {
+		return ""
+	}
+	var sb strings.Builder
+	sb.Grow(len(trimmed))
+	inSingle := false
+	inDouble := false
+	lastSpace := false
+	for i := 0; i < len(trimmed); i++ {
+		ch := trimmed[i]
+		if inSingle {
+			sb.WriteByte(ch)
+			if ch == '\'' {
+				if i+1 < len(trimmed) && trimmed[i+1] == '\'' {
+					i++
+					sb.WriteByte('\'')
+				} else {
+					inSingle = false
+				}
+			}
+			continue
+		}
+		if inDouble {
+			sb.WriteByte(ch)
+			if ch == '"' {
+				if i+1 < len(trimmed) && trimmed[i+1] == '"' {
+					i++
+					sb.WriteByte('"')
+				} else {
+					inDouble = false
+				}
+			}
+			continue
+		}
+		if ch == '\'' {
+			inSingle = true
+			lastSpace = false
+			sb.WriteByte(ch)
+			continue
+		}
+		if ch == '"' {
+			inDouble = true
+			lastSpace = false
+			sb.WriteByte(ch)
+			continue
+		}
+		if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' || ch == '\f' {
+			if !lastSpace {
+				sb.WriteByte(' ')
+				lastSpace = true
+			}
+			continue
+		}
+		lastSpace = false
+		sb.WriteByte(ch)
+	}
+	return sb.String()
+}
+
+func BuildPlanCacheKey(profileName string, policyVer int64, sqlKey string, rlsRules []string) string {
 	h := sha256.New()
 	h.Write([]byte(profileName))
 	h.Write([]byte{0})
 	h.Write([]byte(fmt.Sprintf("%d", policyVer)))
 	h.Write([]byte{0})
-	h.Write([]byte(fingerprint))
+	h.Write([]byte(sqlKey))
 	h.Write([]byte{0})
 	for _, r := range rlsRules {
 		h.Write([]byte(r))

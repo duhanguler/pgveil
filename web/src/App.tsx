@@ -1456,13 +1456,24 @@ with psycopg.connect(DSN) as conn:
                     Unfurler-safe GET preview URL generated:{' '}
                     <code style={{ color: 'var(--ok)' }}>{chatopsPreviewURL}</code>
                   </span>
-                  <button
-                    onClick={() => copyText('chatops-url', chatopsPreviewURL)}
-                    className="px-2 py-0.5 rounded border shrink-0"
-                    style={{ borderColor: 'var(--border)', color: 'var(--ink-1)' }}
-                  >
-                    {copiedKey === 'chatops-url' ? 'Copied' : 'Copy URL'}
-                  </button>
+                  <div className="flex items-center gap-1.5 shrink-0">
+                    <a
+                      href={chatopsPreviewURL}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="px-2 py-0.5 rounded border"
+                      style={{ borderColor: 'var(--ok-border)', color: 'var(--ok)', background: 'var(--ok-subtle)' }}
+                    >
+                      Open Card ↗
+                    </a>
+                    <button
+                      onClick={() => copyText('chatops-url', chatopsPreviewURL)}
+                      className="px-2 py-0.5 rounded border"
+                      style={{ borderColor: 'var(--border)', color: 'var(--ink-1)' }}
+                    >
+                      {copiedKey === 'chatops-url' ? 'Copied' : 'Copy URL'}
+                    </button>
+                  </div>
                 </div>
               )}
 

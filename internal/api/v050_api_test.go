@@ -237,4 +237,114 @@ func TestAPIV050SlackWebhookUnfurlSafeCallbackAndJWTPlayground(t *testing.T) {
 	if jsonCBResp.StatusCode != http.StatusOK {
 		t.Fatalf("JSON callback POST failed: %d", jsonCBResp.StatusCode)
 	}
+
+	// 5. Regression (Bug #3): Origin-scoped CORS must NOT emit wildcard '*' for untrusted external origins
+	evilOptReq, _ := http.NewRequest(http.MethodOptions, ts.URL+"/mcp", nil)
+	evilOptReq.Header.Set("Origin", "https://evil.example.com")
+	evilOptResp, _ := http.DefaultClient.Do(evilOptReq)
+	_ = evilOptResp.Body.Close()
+	if evilOptResp.StatusCode != http.StatusForbidden || evilOptResp.Header.Get("Access-Control-Allow-Origin") != "" {
+		t.Fatalf("CORS bypass! Expected 403 and no ACAO for evil origin, got status=%d acao=%q",
+			evilOptResp.StatusCode, evilOptResp.Header.Get("Access-Control-Allow-Origin"))
+	}
+
+	evilGetReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/api/v1/summary", nil)
+	evilGetReq.Header.Set("Origin", "https://evil.example.com")
+	evilGetResp, _ := http.DefaultClient.Do(evilGetReq)
+	_ = evilGetResp.Body.Close()
+	if evilGetResp.Header.Get("Access-Control-Allow-Origin") != "" {
+		t.Fatalf("CORS leak! Expected empty ACAO for untrusted origin, got %q", evilGetResp.Header.Get("Access-Control-Allow-Origin"))
+	}
+
+	localOptReq, _ := http.NewRequest(http.MethodOptions, ts.URL+"/api/v1/summary", nil)
+	localOptReq.Header.Set("Origin", "http://127.0.0.1:8088")
+	localOptResp, _ := http.DefaultClient.Do(localOptReq)
+	_ = localOptResp.Body.Close()
+	if localOptResp.StatusCode != http.StatusNoContent || localOptResp.Header.Get("Access-Control-Allow-Origin") != "http://127.0.0.1:8088" {
+		t.Fatalf("expected loopback CORS preflight 204 echoing origin, got status=%d acao=%q",
+			localOptResp.StatusCode, localOptResp.Header.Get("Access-Control-Allow-Origin"))
+	}
+
+	// 6. Regression (Bug #6): Preview Signed Card URL from POST /api/v1/chatops/test MUST render 200 OK (not 404!)
+	testCO2, _ := http.Post(ts.URL+"/api/v1/chatops/test", "application/json", strings.NewReader(`{}`))
+	testCO2Body, _ := io.ReadAll(testCO2.Body)
+	_ = testCO2.Body.Close()
+	var coResp struct {
+		SamplePreviewURL string `json:"sample_preview_url"`
+	}
+	_ = json.Unmarshal(testCO2Body, &coResp)
+	if coResp.SamplePreviewURL == "" {
+		t.Fatalf("missing sample_preview_url: %s", string(testCO2Body))
+	}
+	prevU, err := url.Parse(coResp.SamplePreviewURL)
+	if err != nil {
+		t.Fatalf("invalid sample_preview_url %q: %v", coResp.SamplePreviewURL, err)
+	}
+	prevResp, err := http.Get(ts.URL + prevU.RequestURI())
+	if err != nil {
+		t.Fatal(err)
+	}
+	prevHTML, _ := io.ReadAll(prevResp.Body)
+	_ = prevResp.Body.Close()
+	if prevResp.StatusCode != http.StatusOK || !strings.Contains(string(prevHTML), "Demo Preview Card") {
+		t.Fatalf("expected 200 OK Demo Preview Card HTML, got %d %s", prevResp.StatusCode, string(prevHTML))
+	}
+
+	// 7. Regression (Bug #7): Deterministic column order in handleMCPPlaygroundQuery across repeated runs
+	for attempt := 0; attempt < 5; attempt++ {
+		detResp, _ := http.Post(ts.URL+"/api/v1/playground/query", "application/json",
+			strings.NewReader(`{"sql":"SELECT city, email, id FROM customers","profile":"tenant_jwt","jwt_claims":{"city":"Istanbul"}}`))
+		detBody, _ := io.ReadAll(detResp.Body)
+		_ = detResp.Body.Close()
+		var pgOut struct {
+			Columns    []string `json:"columns"`
+			CommandTag string   `json:"command_tag"`
+		}
+		_ = json.Unmarshal(detBody, &pgOut)
+		if strings.Join(pgOut.Columns, ",") != "city,email,id" || !strings.HasPrefix(pgOut.CommandTag, "SELECT ") {
+			t.Fatalf("attempt %d: expected deterministic columns [city,email,id], got %v tag=%q", attempt, pgOut.Columns, pgOut.CommandTag)
+		}
+	}
+
+	// 8. Regression (Bug #8): Blocked Playground query on missing JWT claim reports virtual_rls_missing_claim (HIGH), not policy_allow (LOW)
+	blkResp, _ := http.Post(ts.URL+"/api/v1/playground/query", "application/json",
+		strings.NewReader(`{"sql":"SELECT id, city FROM customers","profile":"tenant_jwt"}`))
+	blkBody, _ := io.ReadAll(blkResp.Body)
+	_ = blkResp.Body.Close()
+	var blkOut struct {
+		Status   string `json:"status"`
+		Decision struct {
+			Action    string `json:"action"`
+			Rule      string `json:"rule"`
+			RiskLevel string `json:"risk_level"`
+		} `json:"decision"`
+	}
+	_ = json.Unmarshal(blkBody, &blkOut)
+	if blkOut.Status != "blocked" || blkOut.Decision.Rule != "virtual_rls_missing_claim" || blkOut.Decision.RiskLevel != "HIGH" {
+		t.Fatalf("expected enriched virtual_rls_missing_claim/HIGH decision, got %+v (body=%s)", blkOut, string(blkBody))
+	}
+
+	// 9. Regression (Bug #10): Wildcard-only profile application_name synthesizes a matching concrete name
+	wildcardYAML := `
+default_profile: analyst
+profiles:
+  - name: ops_team
+    match:
+      application_names: ["ops-*"]
+    firewall:
+      allow_statements: ["SELECT"]
+  - name: analyst
+    firewall:
+      allow_statements: ["SELECT"]
+`
+	wMgr, err := policy.LoadBytes([]byte(wildcardYAML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wSrv := &Server{policyMgr: wMgr}
+	opsProf, _ := wMgr.GetProfileByName("ops_team")
+	synthApp := wSrv.synthesizeAppNameForProfile(opsProf, "pgveil")
+	if matched := wMgr.MatchProfile("pgveil", synthApp); matched.Name != "ops_team" {
+		t.Fatalf("expected synthesized appName %q to match ops_team, got %q", synthApp, matched.Name)
+	}
 }

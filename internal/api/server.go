@@ -9,8 +9,10 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -136,7 +138,7 @@ func (s *Server) Handler() http.Handler {
 		mux.Handle("/", s.spaHandler(s.webFS))
 	}
 
-	return withCORS(s.withOptionalAuth(mux))
+	return s.withCORS(s.withOptionalAuth(mux))
 }
 
 func (s *Server) withOptionalAuth(next http.Handler) http.Handler {
@@ -413,14 +415,7 @@ func (s *Server) handlePlaygroundQuery(w http.ResponseWriter, r *http.Request) {
 
 	cfg := s.policyMgr.Config()
 	proxyTarget := s.resolveProxyAddr()
-	appName := prof.Name
-	for _, cand := range prof.Match.ApplicationNames {
-		c := strings.TrimSpace(cand)
-		if c != "" && !strings.ContainsAny(c, "*?[]") {
-			appName = c
-			break
-		}
-	}
+	appName := s.synthesizeAppNameForProfile(prof, cfg.Server.UpstreamUser)
 
 	// Build pgx connection config targeting pgveil wire proxy with profile-matched application_name
 	connStr := policy.BuildDSN(
@@ -471,15 +466,17 @@ func (s *Server) handlePlaygroundQuery(w http.ResponseWriter, r *http.Request) {
 			pgCode = pgErr.Code
 			pgDetail = pgErr.Detail
 		}
+		enrichedDec, latestAudit := s.enrichBlockedDecision(prof, astDec)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"status":      "blocked",
 			"profile":     prof.Name,
-			"decision":    astDec,
+			"decision":    enrichedDec,
 			"error":       err.Error(),
 			"sqlstate":    pgCode,
 			"detail":      pgDetail,
 			"notices":     notices,
 			"duration_ms": float64(elapsed.Microseconds()) / 1000.0,
+			"audit":       latestAudit,
 		})
 		return
 	}
@@ -506,13 +503,15 @@ func (s *Server) handlePlaygroundQuery(w http.ResponseWriter, r *http.Request) {
 	}
 	if rerr := rows.Err(); rerr != nil {
 		elapsed := time.Since(start)
+		enrichedDec, latestAudit := s.enrichBlockedDecision(prof, astDec)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"status":      "blocked",
 			"profile":     prof.Name,
-			"decision":    astDec,
+			"decision":    enrichedDec,
 			"error":       rerr.Error(),
 			"notices":     notices,
 			"duration_ms": float64(elapsed.Microseconds()) / 1000.0,
+			"audit":       latestAudit,
 		})
 		return
 	}
@@ -634,18 +633,106 @@ func writeJSON(w http.ResponseWriter, status int, data any) {
 	_ = json.NewEncoder(w).Encode(data)
 }
 
-func withCORS(next http.Handler) http.Handler {
+func (s *Server) isCORSOriginAllowed(origin string) bool {
+	allowed := s.policyMgr.Config().MCP.AllowedOrigins
+	if len(allowed) > 0 {
+		for _, a := range allowed {
+			a = strings.TrimSpace(a)
+			if a == "*" || strings.EqualFold(a, origin) {
+				return true
+			}
+		}
+		return false
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "localhost" || host == "127.0.0.1" || host == "::1" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	return false
+}
+
+func (s *Server) withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id")
-		w.Header().Set("Access-Control-Expose-Headers", "Mcp-Session-Id")
-		if r.Method == http.MethodOptions {
+		origin := strings.TrimSpace(r.Header.Get("Origin"))
+		if origin != "" {
+			w.Header().Add("Vary", "Origin")
+			if s.isCORSOriginAllowed(origin) {
+				w.Header().Set("Access-Control-Allow-Origin", origin)
+				w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
+				w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id")
+				w.Header().Set("Access-Control-Expose-Headers", "Mcp-Session-Id")
+				if r.Method == http.MethodOptions {
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+			} else if r.Method == http.MethodOptions {
+				writeJSON(w, http.StatusForbidden, map[string]string{"error": "CORS origin not allowed"})
+				return
+			}
+		} else if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+func (s *Server) synthesizeAppNameForProfile(prof *policy.RoleProfile, dbUser string) string {
+	if prof == nil {
+		return ""
+	}
+	for _, cand := range prof.Match.ApplicationNames {
+		c := strings.TrimSpace(cand)
+		if c != "" && !strings.ContainsAny(c, "*?[]") {
+			if s.policyMgr.MatchProfile(dbUser, c).Name == prof.Name {
+				return c
+			}
+		}
+	}
+	for _, cand := range prof.Match.ApplicationNames {
+		c := strings.TrimSpace(cand)
+		if c == "" {
+			continue
+		}
+		synth := strings.ReplaceAll(c, "*", "pg")
+		synth = strings.ReplaceAll(synth, "?", "a")
+		if s.policyMgr.MatchProfile(dbUser, synth).Name == prof.Name {
+			return synth
+		}
+	}
+	return prof.Name
+}
+
+func (s *Server) enrichBlockedDecision(prof *policy.RoleProfile, astDec firewall.Decision) (firewall.Decision, *events.AuditEvent) {
+	if s.eventBus == nil || prof == nil {
+		return astDec, nil
+	}
+	recent := s.eventBus.Recent(5, "", prof.Name)
+	for i := range recent {
+		ev := recent[i]
+		if ev.SQLFingerprint == astDec.Fingerprint &&
+			(ev.Decision == "BLOCKED" || ev.Decision == "HITL_DENIED" || ev.Decision == "HITL_EXPIRED") {
+			if ev.PolicyRule != "" {
+				astDec.Action = firewall.ActionBlock
+				astDec.Rule = ev.PolicyRule
+				if ev.RiskLevel != "" {
+					astDec.RiskLevel = ev.RiskLevel
+				}
+				if ev.PolicyReason != "" {
+					astDec.Reason = ev.PolicyReason
+				}
+			}
+			return astDec, &ev
+		}
+	}
+	return astDec, nil
 }
 
 func profileUsesJWTPlaceholders(prof *policy.RoleProfile) bool {
@@ -700,18 +787,22 @@ func (s *Server) handleMCPPlaygroundQuery(
 	}
 
 	if isErr {
+		enrichedDec, latestAudit := s.enrichBlockedDecision(prof, astDec)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"status":      "blocked",
 			"profile":     prof.Name,
-			"decision":    astDec,
+			"decision":    enrichedDec,
 			"error":       textOut,
 			"sqlstate":    "42501",
 			"duration_ms": float64(elapsed.Microseconds()) / 1000.0,
+			"audit":       latestAudit,
 		})
 		return
 	}
 
 	var parsed struct {
+		Columns        []string         `json:"columns"`
+		CommandTag     string           `json:"command_tag"`
 		RowCount       int              `json:"row_count"`
 		Truncated      bool             `json:"truncated"`
 		PIICellsMasked int              `json:"pii_cells_masked"`
@@ -719,11 +810,16 @@ func (s *Server) handleMCPPlaygroundQuery(
 	}
 	_ = json.Unmarshal([]byte(textOut), &parsed)
 
-	var cols []string
-	if len(parsed.Rows) > 0 {
+	cols := parsed.Columns
+	if len(cols) == 0 && len(parsed.Rows) > 0 {
 		for k := range parsed.Rows[0] {
 			cols = append(cols, k)
 		}
+		sort.Strings(cols)
+	}
+	cmdTag := parsed.CommandTag
+	if cmdTag == "" {
+		cmdTag = fmt.Sprintf("SELECT %d", len(parsed.Rows))
 	}
 	resultRows := make([][]any, 0, len(parsed.Rows))
 	for _, rec := range parsed.Rows {
@@ -750,7 +846,7 @@ func (s *Server) handleMCPPlaygroundQuery(
 		"columns":     cols,
 		"rows":        resultRows,
 		"row_count":   len(resultRows),
-		"command_tag": fmt.Sprintf("SELECT %d", len(resultRows)),
+		"command_tag": cmdTag,
 		"duration_ms": float64(elapsed.Microseconds()) / 1000.0,
 		"audit":       latestAudit,
 	})
@@ -867,22 +963,54 @@ func (s *Server) handleHITLCallbackPreview(w http.ResponseWriter, r *http.Reques
 	}
 
 	req, ok := s.hitlMgr.Get(id)
+	previewNotice := ""
+	isDemoPreview := false
 	if !ok {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "approval request not found"})
-		return
+		if id == "hitl_test_preview" {
+			cfg := s.policyMgr.Config()
+			req = &hitl.ApprovalRequest{
+				ID:            "hitl_test_preview",
+				CreatedAt:     time.Now().UTC(),
+				ExpiresAt:     time.Now().UTC().Add(5 * time.Minute),
+				DBUser:        cfg.Server.UpstreamUser,
+				Database:      cfg.Server.UpstreamDatabase,
+				RoleProfile:   "ai_agent",
+				StatementType: "UPDATE",
+				RiskLevel:     "HIGH",
+				Rule:          "require_hitl_update",
+				Reason:        "ChatOps connectivity verification test",
+				SQL:           "UPDATE orders SET status = 'approved' WHERE id = 1001;",
+				Status:        hitl.StatusPending,
+				Reviewer:      "demo-preview",
+			}
+			isDemoPreview = true
+			previewNotice = "Demo Preview Card — HMAC-SHA256 signature verified (read-only preview; no live database query is paused)."
+		} else {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "approval request not found"})
+			return
+		}
 	}
 
 	expInt, _ := strconv.ParseInt(expStr, 10, 64)
-	approveTok := s.chatOps.SignActionToken(id, "approve", expInt)
-	denyTok := s.chatOps.SignActionToken(id, "deny", expInt)
+	approveTok := ""
+	denyTok := ""
+	if !isDemoPreview {
+		approveTok = s.chatOps.SignActionToken(id, "approve", expInt)
+		denyTok = s.chatOps.SignActionToken(id, "deny", expInt)
+	}
 
 	if strings.Contains(r.Header.Get("Accept"), "application/json") && !strings.Contains(r.Header.Get("Accept"), "text/html") {
-		writeJSON(w, http.StatusOK, map[string]any{
+		resp := map[string]any{
 			"request":       req,
 			"approve_token": approveTok,
 			"deny_token":    denyTok,
 			"exp":           expStr,
-		})
+		}
+		if isDemoPreview {
+			resp["demo_preview"] = true
+			resp["notice"] = previewNotice
+		}
+		writeJSON(w, http.StatusOK, resp)
 		return
 	}
 
@@ -890,7 +1018,7 @@ func (s *Server) handleHITLCallbackPreview(w http.ResponseWriter, r *http.Reques
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'")
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(chatops.RenderReviewCardHTML(req, expStr, approveTok, denyTok, "")))
+	_, _ = w.Write([]byte(chatops.RenderReviewCardHTML(req, expStr, approveTok, denyTok, previewNotice)))
 }
 
 // handleHITLCallbackAction handles state-mutating POST /webhooks/hitl/callback submissions.

@@ -276,3 +276,106 @@ func TestSidebandCostRunnerPlanCacheAndThresholds(t *testing.T) {
 		t.Fatalf("rich sentinel AST rewrite failed: res=%+v err=%v", richRes, err)
 	}
 }
+
+func TestSecurityBugHuntRegressions(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	demoSrv := demo.NewServer()
+	addr, err := demoSrv.Start(ctx, "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr, err := policy.LoadBytes(demo.BuildDemoConfigYAML("127.0.0.1:0", "127.0.0.1:0", addr))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prof, ok := mgr.GetProfileByName("ai_agent")
+	if !ok {
+		t.Fatal("missing ai_agent profile")
+	}
+	runner := NewCostRunner(mgr, "")
+	defer runner.Close()
+
+	// Bug #2 Regression: PlanCache MUST NOT be poisoned by constant-blind pg_query.Fingerprint!
+	// Both LIMIT 5 and LIMIT 99999999 produce the exact same pg_query.Fingerprint, yet LIMIT 5
+	// is cheap while LIMIT 99999999 triggers a 92,400-cost Cartesian join.
+	qSmall := "SELECT c.id FROM customers c, orders o, payments p LIMIT 5"
+	qHuge := "SELECT c.id FROM customers c, orders o, payments p LIMIT 99999999"
+	fpSmall, _ := pg_query.Fingerprint(qSmall)
+	fpHuge, _ := pg_query.Fingerprint(qHuge)
+	if fpSmall != fpHuge {
+		t.Fatalf("precondition failed: expected identical fingerprints, got %s vs %s", fpSmall, fpHuge)
+	}
+	vSmall := runner.Check(ctx, qSmall, fpSmall, nil, prof)
+	if !vSmall.Evaluated || vSmall.Blocked {
+		t.Fatalf("expected LIMIT 5 query to pass Cost Guard, got %+v", vSmall)
+	}
+	vHuge := runner.Check(ctx, qHuge, fpHuge, nil, prof)
+	if !vHuge.Blocked || vHuge.CacheHit || vHuge.Rule != "cost_guard_max_cost" {
+		t.Fatalf("PlanCache poisoning regression! Expected LIMIT 99999999 to miss cache and block, got %+v", vHuge)
+	}
+	// CanonicalSQLKey collapses unquoted whitespace while preserving quoted spaces verbatim
+	if CanonicalSQLKey("SELECT   1  WHERE  x = 'a  b'") != "SELECT 1 WHERE x = 'a  b'" {
+		t.Fatalf("unexpected CanonicalSQLKey: %q", CanonicalSQLKey("SELECT   1  WHERE  x = 'a  b'"))
+	}
+
+	// Bug #11 Regression: Multi-statement Simple Query cannot bypass Cost Guard with trailing "; SELECT 1"
+	multiBomb := "SELECT c.id FROM customers c, orders o, payments p; SELECT 1;"
+	vMulti := runner.Check(ctx, multiBomb, "", nil, prof)
+	if !vMulti.Blocked || vMulti.Rule != "cost_guard_max_cost" {
+		t.Fatalf("multi-statement Cost Guard bypass regression! Got %+v", vMulti)
+	}
+
+	// Bug #12 Regression: CROSS JOIN in embedded demo execExplain properly deparses with PG Version
+	crossBomb := "SELECT c.id FROM customers c CROSS JOIN orders o"
+	vCross := runner.Check(ctx, crossBomb, "", nil, prof)
+	if !vCross.Blocked || vCross.Rule != "cost_guard_max_cost" {
+		t.Fatalf("CROSS JOIN demo EXPLAIN deparse regression! Got %+v", vCross)
+	}
+
+	// Bug #5a Regression: Cross-claim sentinel substitution MUST NOT happen when claim A contains token B
+	twoClaimProf := &policy.RoleProfile{
+		Name: "two_claim",
+		Firewall: policy.FirewallPolicy{
+			RowFilters: []policy.RowFilterPolicy{
+				{
+					Table:     "customers",
+					Predicate: "city = {{jwt.a}} AND country = {{jwt.b}}",
+				},
+			},
+		},
+	}
+	resCross, err := RewriteWithRLS("SELECT id FROM customers", twoClaimProf, SessionContext{
+		Claims: map[string]string{
+			"a": "__pgveil_ph_1__",
+			"b": "SECRET_TENANT",
+		},
+	})
+	if err != nil || !resCross.Rewritten {
+		t.Fatalf("two-claim RLS rewrite failed: %v", err)
+	}
+	if !strings.Contains(resCross.SQL, "'__pgveil_ph_1__'") || strings.Count(resCross.SQL, "SECRET_TENANT") != 1 {
+		t.Fatalf("cross-claim sentinel injection detected in rewritten SQL: %s", resCross.SQL)
+	}
+
+	// Bug #5b Regression: qualifyColumns must qualify columns inside MinMaxExpr (GREATEST) and RowExpr (ROW)
+	joinQualProf := &policy.RoleProfile{
+		Name: "join_qual",
+		Firewall: policy.FirewallPolicy{
+			RowFilters: []policy.RowFilterPolicy{
+				{
+					Table:     "customers",
+					Predicate: "GREATEST(city, 'A') <> '' AND ROW(city, id) IS NOT NULL",
+				},
+			},
+		},
+	}
+	resJoin, err := RewriteWithRLS("SELECT c.id FROM customers c JOIN orders o ON c.id = o.customer_id", joinQualProf, SessionContext{})
+	if err != nil || !resJoin.Rewritten {
+		t.Fatalf("join MinMax/Row qualification failed: %v", err)
+	}
+	if !strings.Contains(resJoin.SQL, "GREATEST(c.city, 'A')") || !strings.Contains(resJoin.SQL, "ROW(c.city, c.id)") {
+		t.Fatalf("expected c.city and c.id qualified inside GREATEST/ROW, got: %s", resJoin.SQL)
+	}
+}

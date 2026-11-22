@@ -96,7 +96,7 @@ func (v *Verifier) AuthenticateHeader(ctx context.Context, authHeader string, fa
 	}
 
 	raw := strings.TrimSpace(authHeader)
-	if !strings.HasPrefix(raw, "Bearer ") && !strings.HasPrefix(raw, "bearer ") {
+	if len(raw) < 7 || !strings.EqualFold(raw[:7], "Bearer ") {
 		return VerifiedIdentity{}, ErrMissingToken
 	}
 	tok := strings.TrimSpace(raw[7:])
@@ -123,6 +123,9 @@ func (v *Verifier) VerifyToken(ctx context.Context, token string, fallbackProfil
 				prof := ak.Profile
 				if prof == "" {
 					prof = fallbackProfile
+				}
+				if canonical, ok := findProfile(cfg, prof); ok {
+					prof = canonical.Name
 				}
 				claims := make(map[string]string, len(ak.Claims))
 				for k, val := range ak.Claims {
@@ -221,15 +224,19 @@ func (v *Verifier) VerifyToken(ctx context.Context, token string, fallbackProfil
 	}
 
 	resolvedProfile := fallbackProfile
+	if canonical, ok := findProfile(cfg, resolvedProfile); ok {
+		resolvedProfile = canonical.Name
+	}
 	roleClaimKey := authCfg.RoleClaim
 	if roleClaimKey == "" {
 		roleClaimKey = "role"
 	}
 	if claimedRole := strings.TrimSpace(flat[roleClaimKey]); claimedRole != "" {
-		if err := v.checkProfilePermitted(claimedRole, cfg); err != nil {
+		canonicalRole, err := v.checkProfilePermitted(claimedRole, cfg)
+		if err != nil {
 			return VerifiedIdentity{}, err
 		}
-		resolvedProfile = claimedRole
+		resolvedProfile = canonicalRole
 	}
 
 	return VerifiedIdentity{
@@ -240,31 +247,31 @@ func (v *Verifier) VerifyToken(ctx context.Context, token string, fallbackProfil
 	}, nil
 }
 
-func (v *Verifier) checkProfilePermitted(profileName string, cfg *policy.Config) error {
+func (v *Verifier) checkProfilePermitted(profileName string, cfg *policy.Config) (string, error) {
 	prof, ok := findProfile(cfg, profileName)
 	if !ok {
-		return fmt.Errorf("%w: unknown profile %q", ErrProfileNotPermitted, profileName)
+		return "", fmt.Errorf("%w: unknown profile %q", ErrProfileNotPermitted, profileName)
 	}
 	// Explicit allowlist check when configured
 	if len(cfg.MCP.Auth.AllowedProfiles) > 0 {
 		for _, allowed := range cfg.MCP.Auth.AllowedProfiles {
 			if strings.EqualFold(allowed, prof.Name) {
-				return nil
+				return prof.Name, nil
 			}
 		}
-		return fmt.Errorf("%w: profile %q is not in mcp.auth.allowed_profiles", ErrProfileNotPermitted, profileName)
+		return "", fmt.Errorf("%w: profile %q is not in mcp.auth.allowed_profiles", ErrProfileNotPermitted, profileName)
 	}
 	// Default privilege-escalation guard: never allow dynamic JWT claims to select an unmasked
 	// or wildcard-statement admin profile unless explicitly listed in allowed_profiles.
 	for _, st := range prof.Firewall.AllowStatements {
 		if strings.TrimSpace(st) == "*" {
-			return fmt.Errorf("%w: wildcard profile %q requires explicit listing in mcp.auth.allowed_profiles", ErrProfileNotPermitted, prof.Name)
+			return "", fmt.Errorf("%w: wildcard profile %q requires explicit listing in mcp.auth.allowed_profiles", ErrProfileNotPermitted, prof.Name)
 		}
 	}
 	if !prof.Masking.Enabled {
-		return fmt.Errorf("%w: unmasked profile %q requires explicit listing in mcp.auth.allowed_profiles", ErrProfileNotPermitted, prof.Name)
+		return "", fmt.Errorf("%w: unmasked profile %q requires explicit listing in mcp.auth.allowed_profiles", ErrProfileNotPermitted, prof.Name)
 	}
-	return nil
+	return prof.Name, nil
 }
 
 func findProfile(cfg *policy.Config, name string) (*policy.RoleProfile, bool) {

@@ -7,6 +7,7 @@
   <a href="https://codecov.io/gh/duhanguler/pgveil"><img src="https://codecov.io/gh/duhanguler/pgveil/graph/badge.svg" alt="Codecov" /></a>
   <a href="https://pkg.go.dev/github.com/duhanguler/pgveil"><img src="https://pkg.go.dev/badge/github.com/duhanguler/pgveil.svg" alt="Go Reference" /></a>
   <a href="https://mcpservers.org/servers/duhanguler/pgveil"><img src="https://mcpservers.org/badge.svg" alt="Listed on mcpservers.org" /></a>
+  <a href="https://glama.ai/mcp/servers/duhanguler/pgveil"><img src="https://glama.ai/mcp/servers/duhanguler/pgveil/badges/score.svg" alt="duhanguler/pgveil MCP server" /></a>
   <a href="https://github.com/duhanguler/pgveil/releases"><img src="https://img.shields.io/badge/Release-v0.5.0-18181b?style=flat-square" alt="v0.5.0" /></a>
   <a href="https://github.com/duhanguler/homebrew-tap"><img src="https://img.shields.io/badge/Homebrew-duhanguler%2Ftap%2Fpgveil-18181b?style=flat-square&logo=homebrew&logoColor=white" alt="Homebrew Tap" /></a>
   <img src="https://img.shields.io/badge/Go-1.26%2B-00ADD8?style=flat-square&logo=go&logoColor=white" alt="Go 1.26+" />
@@ -324,7 +325,10 @@ make build
 ```
 
 ### Option 4 — Connect Claude Desktop / Cursor MCP (Zero Node.js or Wire Mode)
-Native single-binary MCP ([`examples/mcp-claude/pgveil_native_mcp.json`](examples/mcp-claude/pgveil_native_mcp.json)):
+
+[![duhanguler/pgveil MCP server](https://glama.ai/mcp/servers/duhanguler/pgveil/badges/score.svg)](https://glama.ai/mcp/servers/duhanguler/pgveil)
+
+Native single-binary MCP ([`examples/mcp-claude/pgveil_native_mcp.json`](examples/mcp-claude/pgveil_native_mcp.json)) exposing five read-only guarded tools (`list_tables`, `describe_table`, `inspect_policy`, `explain_query`, and `query`):
 
 ```json
 {
@@ -336,6 +340,15 @@ Native single-binary MCP ([`examples/mcp-claude/pgveil_native_mcp.json`](example
   }
 }
 ```
+
+Optional environment variables when running `pgveil mcp` (or the default Docker MCP image `docker build -t pgveil-mcp . && docker run -i pgveil-mcp`):
+
+| Environment Variable | Required | Default | Description |
+| --- | --- | --- | --- |
+| `PGVEIL_CONFIG` | No | `configs/pgveil.yaml` | Path to the pgveil YAML policy configuration file |
+| `PGVEIL_PROFILE` | No | `ai_agent` | Role profile enforced on MCP tool calls |
+| `PGVEIL_DSN` / `DATABASE_URL` | No | From config | Optional PostgreSQL connection URI override |
+| `PGVEIL_MCP_HTTP` | No | *(empty — stdio)* | Optional HTTP listen address (e.g. `:8090`) for Streamable HTTP MCP |
 
 Or wire-proxy mode with the official Postgres MCP server ([`examples/mcp-claude/claude_desktop_config.json`](examples/mcp-claude/claude_desktop_config.json)) and Python `psycopg` agent ([`examples/python-agent/agent_demo.py`](examples/python-agent/agent_demo.py)).
 

@@ -43,3 +43,8 @@ COPY --from=go-builder /out/pgveil-audit-worker /usr/local/bin/pgveil-audit-work
 USER pgveil
 EXPOSE 8089
 ENTRYPOINT ["pgveil-audit-worker"]
+
+# Stage 5: Default minimal runtime image for native MCP stdio server (Glama / MCP clients)
+FROM pgveil AS mcp
+ENTRYPOINT []
+CMD ["pgveil", "mcp", "--config", "/app/configs/pgveil.yaml"]

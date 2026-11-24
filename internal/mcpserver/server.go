@@ -28,6 +28,15 @@ const (
 	StreamableProtocolVersion = "2025-03-26"
 )
 
+var supportedProtocolVersions = map[string]bool{
+	"2024-11-05": true,
+	"2025-03-26": true,
+	"2025-06-18": true,
+	"2025-11-25": true,
+}
+
+const serverInstructions = "pgveil is a zero-trust PostgreSQL MCP server protected by a PostgreSQL 17 AST SQL firewall, Virtual Row-Level Security (RLS) predicate rewriter, sideband EXPLAIN cost guard, PII side-channel oracle guard, dynamic multi-compliance PII masker (GDPR/KVKK/PCI-DSS/HIPAA/Secrets), and row-exfiltration cap. Recommended workflow: (1) call list_tables to discover accessible tables (restricted tables are automatically omitted), (2) call describe_table to inspect column types and active PII masking strategies, (3) call inspect_policy to view active firewall/RLS rules or pre-flight validate a SQL query offline, (4) call explain_query to inspect execution plans without reading rows, and (5) call query to execute guarded read-only SQL."
+
 type callerCtxKey struct{}
 
 // CallerIdentity carries authenticated HTTP/JWT caller attributes into MCP tool execution.
@@ -200,8 +209,8 @@ func (s *Server) HandleRequest(ctx context.Context, req RPCRequest) *RPCResponse
 			ProtocolVersion string `json:"protocolVersion"`
 		}
 		if len(req.Params) > 0 && json.Unmarshal(req.Params, &initParams) == nil {
-			if initParams.ProtocolVersion == StreamableProtocolVersion {
-				protoVer = StreamableProtocolVersion
+			if supportedProtocolVersions[initParams.ProtocolVersion] {
+				protoVer = initParams.ProtocolVersion
 			}
 		}
 		return &RPCResponse{
@@ -216,6 +225,7 @@ func (s *Server) HandleRequest(ctx context.Context, req RPCRequest) *RPCResponse
 					"name":    "pgveil-mcp",
 					"version": s.version,
 				},
+				"instructions": serverInstructions,
 			},
 		}
 	case "tools/list":
@@ -224,6 +234,22 @@ func (s *Server) HandleRequest(ctx context.Context, req RPCRequest) *RPCResponse
 			ID:      req.ID,
 			Result: map[string]any{
 				"tools": s.toolDefinitions(),
+			},
+		}
+	case "prompts/list":
+		return &RPCResponse{
+			JSONRPC: "2.0",
+			ID:      req.ID,
+			Result: map[string]any{
+				"prompts": []any{},
+			},
+		}
+	case "resources/list":
+		return &RPCResponse{
+			JSONRPC: "2.0",
+			ID:      req.ID,
+			Result: map[string]any{
+				"resources": []any{},
 			},
 		}
 	case "tools/call":
@@ -259,44 +285,93 @@ func (s *Server) HandleRequest(ctx context.Context, req RPCRequest) *RPCResponse
 }
 
 func (s *Server) toolDefinitions() []map[string]any {
+	readOnlyAnnotations := map[string]any{
+		"readOnlyHint":    true,
+		"destructiveHint": false,
+		"idempotentHint":  true,
+		"openWorldHint":   false,
+	}
 	return []map[string]any{
 		{
 			"name":        "list_tables",
-			"description": "List accessible PostgreSQL tables (restricted/secret tables are automatically hidden by pgveil policy).",
-			"inputSchema": map[string]any{"type": "object", "properties": map[string]any{}},
+			"title":       "List Accessible Tables",
+			"description": "List accessible PostgreSQL base tables visible to the active pgveil role profile. Call this first before writing SQL so you know which tables exist; restricted tables configured in denied_tables are automatically omitted.",
+			"inputSchema": map[string]any{
+				"type":                 "object",
+				"properties":           map[string]any{},
+				"additionalProperties": false,
+			},
+			"annotations": readOnlyAnnotations,
 		},
 		{
 			"name":        "describe_table",
-			"description": "Inspect column names, data types, and active PII masking rules for an allowed PostgreSQL table.",
+			"title":       "Describe Table Schema and Masking",
+			"description": "Inspect column names, PostgreSQL data types, nullability, and active pgveil PII masking strategies for a single allowed table. Call this after list_tables to verify column names and identify protected PII columns before querying. Refuses restricted tables and system catalogs.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"table": map[string]any{"type": "string", "description": "Table name (e.g., customers, orders)"},
+					"table": map[string]any{
+						"type":        "string",
+						"minLength":   1,
+						"description": "Target table name, optionally schema-qualified (for example, 'customers' or 'public.orders').",
+					},
 				},
-				"required": []string{"table"},
+				"required":             []string{"table"},
+				"additionalProperties": false,
 			},
+			"annotations": readOnlyAnnotations,
 		},
 		{
-			"name":        "query",
-			"description": "Execute a read-only SQL query protected by pgveil's PostgreSQL 17 AST firewall, PII side-channel guard, dynamic GDPR/KVKK/PCI-DSS masker, and row-exfiltration cap.",
+			"name":        "inspect_policy",
+			"title":       "Inspect Policy and Pre-Flight SQL",
+			"description": "Inspect the active pgveil role profile's firewall rules (allowed statements, allowed/denied tables, row cap, rate limits, Virtual RLS filters) and PII masking rules without connecting to PostgreSQL. Optionally pass a SQL statement to pre-flight validate it offline against the PostgreSQL 17 AST firewall and Virtual RLS rewriter.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"sql": map[string]any{"type": "string", "description": "PostgreSQL SELECT / EXPLAIN / SHOW statement"},
+					"sql": map[string]any{
+						"type":        "string",
+						"description": "Optional SQL statement to evaluate offline against the AST firewall and Virtual RLS rewriter.",
+					},
 				},
-				"required": []string{"sql"},
+				"additionalProperties": false,
 			},
+			"annotations": readOnlyAnnotations,
 		},
 		{
 			"name":        "explain_query",
-			"description": "Inspect the PostgreSQL execution plan (EXPLAIN) for a query without exposing table rows.",
+			"title":       "Explain Query Execution Plan",
+			"description": "Return the PostgreSQL query execution plan (EXPLAIN without ANALYZE) for a SELECT statement to inspect index usage and estimated cost without reading or returning table rows. Disallows EXPLAIN ANALYZE to guarantee zero side effects.",
 			"inputSchema": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"sql": map[string]any{"type": "string", "description": "SELECT statement to analyze"},
+					"sql": map[string]any{
+						"type":        "string",
+						"minLength":   1,
+						"description": "PostgreSQL SELECT statement to analyze (with or without a leading EXPLAIN keyword; EXPLAIN ANALYZE is blocked).",
+					},
 				},
-				"required": []string{"sql"},
+				"required":             []string{"sql"},
+				"additionalProperties": false,
 			},
+			"annotations": readOnlyAnnotations,
+		},
+		{
+			"name":        "query",
+			"title":       "Execute Guarded SQL Query",
+			"description": "Execute a read-only PostgreSQL SELECT, EXPLAIN, or SHOW query protected by pgveil's PostgreSQL 17 AST firewall, Virtual Row-Level Security (RLS) predicate injection, sideband EXPLAIN cost guard, PII side-channel oracle guard, dynamic GDPR/KVKK/PCI-DSS/HIPAA/Secrets masker, and row-exfiltration cap. Destructive statements, tautologies, system catalogs, and PII inference predicates are blocked.",
+			"inputSchema": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"sql": map[string]any{
+						"type":        "string",
+						"minLength":   1,
+						"description": "Read-only PostgreSQL SELECT, EXPLAIN, or SHOW query to execute under the active pgveil policy profile.",
+					},
+				},
+				"required":             []string{"sql"},
+				"additionalProperties": false,
+			},
+			"annotations": readOnlyAnnotations,
 		},
 	}
 }
@@ -324,6 +399,9 @@ func (s *Server) callTool(ctx context.Context, name string, args map[string]any)
 	case "describe_table":
 		tbl, _ := args["table"].(string)
 		return s.toolDescribeTable(ctx, prof, tbl)
+	case "inspect_policy":
+		sqlStr, _ := args["sql"].(string)
+		return s.toolInspectPolicy(prof, caller, sqlStr)
 	case "query":
 		sqlStr, _ := args["sql"].(string)
 		return s.toolQuery(ctx, prof, caller, sqlStr)
@@ -471,6 +549,58 @@ func (s *Server) toolDescribeTable(ctx context.Context, prof *policy.RoleProfile
 		"columns": cols,
 	}, "", "  ")
 	return string(out), false
+}
+
+func (s *Server) toolInspectPolicy(prof *policy.RoleProfile, caller CallerIdentity, sqlStr string) (string, bool) {
+	maskRules := make(map[string]string, len(prof.Masking.ColumnRules))
+	for _, r := range prof.Masking.ColumnRules {
+		maskRules[r.Column] = string(r.Strategy)
+	}
+	res := map[string]any{
+		"profile":                prof.Name,
+		"audit_only":             prof.IsAuditOnly(),
+		"allow_statements":       prof.Firewall.AllowStatements,
+		"max_rows":               prof.Firewall.MaxRows,
+		"block_ddl":              prof.Firewall.BlockDDL,
+		"block_pii_inference":    prof.Firewall.BlockPIIInference,
+		"block_system_catalogs":  prof.Firewall.BlockSystemCatalogs,
+		"allowed_tables":         prof.Firewall.AllowedTables,
+		"denied_tables":          prof.Firewall.DeniedTables,
+		"virtual_rls_filters":    len(prof.Firewall.RowFilters),
+		"masking_enabled":        prof.Masking.Enabled,
+		"auto_detect_pii":        prof.Masking.AutoDetectPII,
+		"compliance_packs":       prof.Masking.CompliancePacks,
+		"masked_columns":         maskRules,
+		"max_queries_per_minute": prof.Firewall.RateLimit.MaxQueriesPerMinute,
+	}
+	if trimmed := strings.TrimSpace(sqlStr); trimmed != "" {
+		dec := firewall.Evaluate(trimmed, prof)
+		preflight := map[string]any{
+			"action": string(dec.Action),
+			"rule":   dec.Rule,
+			"reason": dec.Reason,
+		}
+		if dec.Action == firewall.ActionAllow && !prof.IsAuditOnly() && len(prof.Firewall.RowFilters) > 0 {
+			cfg := s.policyMgr.Config()
+			rlsRes, err := firewall.RewriteWithRLS(trimmed, prof, firewall.SessionContext{
+				DBUser:          cfg.Server.UpstreamUser,
+				Database:        cfg.Server.UpstreamDatabase,
+				ApplicationName: caller.Source,
+				RoleProfile:     prof.Name,
+				Claims:          caller.Claims,
+			})
+			if err != nil {
+				preflight["rls_error"] = err.Error()
+			} else if rlsRes.Rewritten {
+				preflight["rls_rewritten"] = true
+				preflight["rewritten_sql"] = rlsRes.SQL
+				preflight["rls_rules_applied"] = rlsRes.RulesApplied
+			}
+		}
+		res["sql_preflight"] = preflight
+	}
+	payload, _ := json.MarshalIndent(res, "", "  ")
+	return string(payload), false
 }
 
 func (s *Server) toolQuery(ctx context.Context, prof *policy.RoleProfile, caller CallerIdentity, sqlStr string) (string, bool) {

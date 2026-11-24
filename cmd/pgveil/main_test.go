@@ -71,10 +71,13 @@ func TestCLIHelpersAndSubcommands(t *testing.T) {
 		t.Fatal("expected missing profile error")
 	}
 
-	// Test runMCPCtx with initialize JSON-RPC message
+	// Test runMCPCtx with env var defaults (zero CLI flags)
+	t.Setenv("PGVEIL_CONFIG", demoCfgPath)
+	t.Setenv("PGVEIL_PROFILE", "tenant_tr")
+	t.Setenv("PGVEIL_DSN", dsn)
 	mcpIn := strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}` + "\n")
 	var mcpOut bytes.Buffer
-	if err := runMCPCtx(ctx, []string{"--config", demoCfgPath, "--profile", "ai_agent", "--dsn", dsn}, mcpIn, &mcpOut); err != nil {
+	if err := runMCPCtx(ctx, nil, mcpIn, &mcpOut); err != nil {
 		t.Fatalf("runMCPCtx failed: %v", err)
 	}
 	if !strings.Contains(mcpOut.String(), "pgveil") {

@@ -440,12 +440,21 @@ func runMCP(args []string) {
 	}
 }
 
+func envOrDefault(keys []string, fallback string) string {
+	for _, k := range keys {
+		if v := strings.TrimSpace(os.Getenv(k)); v != "" {
+			return v
+		}
+	}
+	return fallback
+}
+
 func runMCPCtx(ctx context.Context, args []string, r io.Reader, w io.Writer) error {
 	fs := flag.NewFlagSet("mcp", flag.ContinueOnError)
-	cfgPath := fs.String("config", "configs/pgveil.yaml", "Path to pgveil YAML configuration file")
-	profileName := fs.String("profile", "ai_agent", "Role profile enforced on MCP tool calls")
-	dsn := fs.String("dsn", "", "Optional PostgreSQL DSN override")
-	httpAddr := fs.String("http", "", "Optional address to serve Streamable HTTP MCP (e.g. :8090) instead of stdio")
+	cfgPath := fs.String("config", envOrDefault([]string{"PGVEIL_CONFIG"}, "configs/pgveil.yaml"), "Path to pgveil YAML configuration file (env: PGVEIL_CONFIG)")
+	profileName := fs.String("profile", envOrDefault([]string{"PGVEIL_PROFILE"}, "ai_agent"), "Role profile enforced on MCP tool calls (env: PGVEIL_PROFILE)")
+	dsn := fs.String("dsn", envOrDefault([]string{"PGVEIL_DSN", "DATABASE_URL"}, ""), "Optional PostgreSQL DSN override (env: PGVEIL_DSN or DATABASE_URL)")
+	httpAddr := fs.String("http", envOrDefault([]string{"PGVEIL_MCP_HTTP"}, ""), "Optional address to serve Streamable HTTP MCP (e.g. :8090) instead of stdio (env: PGVEIL_MCP_HTTP)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
